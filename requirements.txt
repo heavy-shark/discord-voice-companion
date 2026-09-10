@@ -1,19 +1,23 @@
 # Core dependencies
-discord.py>=2.2.0
+discord.py>=2.7.1
 discord-ext-voice-recv>=0.5.2a179
-google-cloud-speech>=2.21.0
-google-genai>=0.3.0
-elevenlabs>=0.2.0
-textual>=0.50.0
-python-dotenv>=1.0.0
+
+# Transcription + conversation (Gemini Live API transcription needs >=1.33)
+google-genai>=1.33.0
+
+# Text-to-Speech: ElevenLabs is called over plain REST/WebSocket on purpose;
+# the official SDK is not a dependency.
+websockets>=13.0
+
+textual>=8.2.3
+python-dotenv>=1.2.2
 
 # Audio & voice support
-davey>=0.1.4
+davey>=0.1.5
 PyNaCl>=1.5.0,<1.6
-pydub>=0.25.0
-webrtcvad>=2.0.10
+pydub>=0.25.1
 
 # Utilities
-pydantic>=2.0.0
-httpx>=0.25.0
-cryptography>=44.0.0
+pydantic>=2.13.0
+httpx>=0.28.1
+cryptography>=46.0.7

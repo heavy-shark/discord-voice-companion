@@ -52,7 +52,10 @@ async def test_synthesize_to_file_posts_expected_request_and_writes_bytes(tmp_pa
         assert request.url.params.get("output_format") == "mp3_44100_128"
         body = json.loads(request.content.decode("utf-8"))
         assert body["text"] == "Hello from the test."
-        assert body["model_id"] == "eleven_multilingual_v2"
+        assert body["model_id"] == "eleven_flash_v2_5"
+        # No language is pinned: replies switch between Ukrainian, Russian and
+        # English, and Flash v2.5 infers the language from the text.
+        assert "language_code" not in body
         return httpx.Response(200, content=b"\xff\xfb" + b"\x00" * 200)
 
     transport = httpx.MockTransport(handler)
@@ -77,6 +80,24 @@ async def test_stream_synthesize_yields_chunks() -> None:
     async for part in client.stream_synthesize("x", _persona()):
         chunks.append(part)
     assert b"".join(chunks) == b"abcdef"
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm_requests_48khz_pcm_for_discord() -> None:
+    """Discord plays 48 kHz PCM, so asking for it avoids an MP3 decode step."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"\x01\x02\x03\x04")
+
+    transport = httpx.MockTransport(handler)
+    client = ElevenLabsTTSClient("k", http_transport=transport)
+
+    chunks = [chunk async for chunk in client.stream_pcm("привіт", _persona())]
+
+    assert b"".join(chunks) == b"\x01\x02\x03\x04"
+    assert seen[0].url.params.get("output_format") == "pcm_48000"
 
 
 @pytest.mark.asyncio

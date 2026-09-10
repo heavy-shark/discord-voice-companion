@@ -4,7 +4,16 @@ import json
 import time
 from pathlib import Path
 
-from src.conversation import PersonaManager, ReplyTriggerPolicy, TriggerState
+import pytest
+
+from src.conversation import (
+    DEFAULT_TALKATIVENESS,
+    PersonaManager,
+    ReplyTriggerPolicy,
+    TalkativenessProfile,
+    TriggerReason,
+    TriggerState,
+)
 from src.conversation.log import ConversationLog
 from src.models import Persona, TranscriptSegment
 from src.storage.transcripts import TranscriptSessionWriter
@@ -14,11 +23,80 @@ class TestReplyTriggerPolicy:
     """Test reply trigger policy."""
 
     def test_policy_initialization(self):
-        """Test initializing ReplyTriggerPolicy."""
+        """Timings default to whatever the talkativeness dial implies."""
         policy = ReplyTriggerPolicy()
+        expected = TalkativenessProfile.from_dial(DEFAULT_TALKATIVENESS)
         assert policy.state == TriggerState.LISTENING
-        assert policy.silence_timeout_seconds == 5.0
-        assert policy.cooldown_seconds == 180.0
+        assert policy.talkativeness == DEFAULT_TALKATIVENESS
+        assert policy.silence_timeout_seconds == expected.silence_timeout_seconds
+        assert policy.cooldown_seconds == expected.cooldown_seconds
+
+    def test_explicit_timings_override_the_dial(self):
+        policy = ReplyTriggerPolicy(silence_timeout_seconds=4.0, cooldown_seconds=90.0)
+        assert policy.silence_timeout_seconds == 4.0
+        assert policy.cooldown_seconds == 90.0
+
+    def test_higher_talkativeness_shortens_both_timers(self):
+        quiet = ReplyTriggerPolicy(talkativeness=10)
+        chatty = ReplyTriggerPolicy(talkativeness=90)
+        assert chatty.silence_timeout_seconds < quiet.silence_timeout_seconds
+        assert chatty.cooldown_seconds < quiet.cooldown_seconds
+
+    def test_talkativeness_is_clamped_to_the_valid_range(self):
+        assert ReplyTriggerPolicy(talkativeness=-50).talkativeness == 0
+        assert ReplyTriggerPolicy(talkativeness=500).talkativeness == 100
+
+    def test_the_dial_endpoints_are_the_configured_extremes(self):
+        quiet = TalkativenessProfile.from_dial(0)
+        chatty = TalkativenessProfile.from_dial(100)
+        assert quiet.silence_timeout_seconds == pytest.approx(6.0)
+        assert quiet.cooldown_seconds == pytest.approx(180.0)
+        assert chatty.silence_timeout_seconds == pytest.approx(1.6)
+        assert chatty.cooldown_seconds == pytest.approx(8.0)
+
+    def test_the_middle_of_the_dial_is_not_dragged_toward_the_quiet_end(self):
+        """Linear interpolation would put the midpoint cooldown at 94s, which
+        does not read as 'moderately chatty' to anyone listening."""
+        middle = TalkativenessProfile.from_dial(50)
+        assert 30.0 < middle.cooldown_seconds < 45.0
+        assert 2.5 < middle.silence_timeout_seconds < 3.5
+
+    def test_the_default_dial_behaves_like_an_engaged_participant(self):
+        profile = TalkativenessProfile.from_dial(DEFAULT_TALKATIVENESS)
+        assert profile.volunteers
+        assert profile.silence_timeout_seconds < 3.0
+        assert profile.cooldown_seconds < 30.0
+
+    def test_zero_talkativeness_never_volunteers(self):
+        """At 0 the bot answers when addressed and otherwise stays silent."""
+        policy = ReplyTriggerPolicy(talkativeness=0, silence_timeout_seconds=0.0)
+        policy.record_human_speech()
+        assert policy.evaluate(has_pending_transcript=True).should_reply is False
+
+        policy.record_mention()
+        decision = policy.evaluate(has_pending_transcript=True)
+        assert decision.should_reply is True
+        assert decision.reason is TriggerReason.ADDRESSED
+
+    def test_unprompted_trigger_is_reported_as_volunteered(self):
+        policy = ReplyTriggerPolicy(
+            talkativeness=90, silence_timeout_seconds=0.0, cooldown_seconds=0.0
+        )
+        policy.record_human_speech()
+        decision = policy.evaluate(has_pending_transcript=True)
+        assert decision.should_reply is True
+        assert decision.reason is TriggerReason.VOLUNTEERED
+
+    def test_declining_to_volunteer_starts_the_cooldown(self):
+        policy = ReplyTriggerPolicy(
+            talkativeness=90, silence_timeout_seconds=0.0, cooldown_seconds=60.0
+        )
+        policy.record_human_speech()
+        assert policy.evaluate(has_pending_transcript=True).should_reply is True
+
+        policy.record_declined_reply()
+        # Same pending transcript, but the bot just passed on it.
+        assert policy.evaluate(has_pending_transcript=True).should_reply is False
 
     def test_no_trigger_without_speech(self):
         """Test no trigger when no speech recorded."""

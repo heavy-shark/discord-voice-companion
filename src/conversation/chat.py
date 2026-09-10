@@ -4,39 +4,105 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from google import genai
 from google.genai import types
 
 from ..models import Persona, UsageCounters
+from ..storage.reply_locale import is_auto_reply_locale
 
 logger = logging.getLogger(__name__)
 
+# Human-readable names for the tags the companion is expected to hear. Prompting
+# with "Ukrainian" is far more reliable than prompting with "uk-UA".
+_LANGUAGE_NAMES: dict[str, str] = {
+    "uk": "Ukrainian",
+    "ru": "Russian",
+    "en": "English",
+    "pl": "Polish",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "da": "Danish",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "no": "Norwegian",
+    "cs": "Czech",
+    "tr": "Turkish",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "zh": "Chinese",
+}
 
-def _reply_locale_system_prefix(locale_tag: str) -> str:
-    """Prepend so locale wins over persona tone and English-heavy user turns."""
+DEFAULT_SPOKEN_LANGUAGES: tuple[str, ...] = ("uk-UA", "ru-RU", "en-US")
+
+
+def language_name(tag: str) -> str:
+    """Map a BCP-47 tag to an English language name, falling back to the tag."""
+    cleaned = (tag or "").strip()
+    if not cleaned:
+        return ""
+    primary = cleaned.replace("_", "-").split("-", 1)[0].lower()
+    return _LANGUAGE_NAMES.get(primary, cleaned)
+
+
+def _language_name_list(tags: Sequence[str]) -> str:
+    """"Ukrainian, Russian or English" from a list of BCP-47 tags."""
+    names: list[str] = []
+    for tag in tags:
+        name = language_name(tag)
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return "the language the speaker used"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" or {names[-1]}"
+
+
+def _mirror_language_rule(spoken_languages: Sequence[str]) -> str:
+    """The 'answer in whatever they spoke' rule used when no locale is pinned."""
+    allowed = _language_name_list(spoken_languages)
     return (
-        f"[OUTPUT LANGUAGE — HIGHEST PRIORITY] Write every assistant message only in "
-        f'locale "{locale_tag}" (BCP-47). Do not use English unless that locale is English '
-        f"(e.g. en-US). Do not mirror another language from the room or from instructions.\n\n"
+        "[OUTPUT LANGUAGE — HIGHEST PRIORITY] Reply in the same language the last "
+        f"speaker used. The people here speak {allowed}, so expect to switch "
+        "between them mid-conversation. Match the speaker turn by turn: a "
+        "Ukrainian question gets a Ukrainian answer, a Russian question gets a "
+        "Russian answer, an English question gets an English answer. Never "
+        "translate or comment on which language you are using, and never default "
+        "to English just because these instructions are in English."
     )
 
 
-def _reply_locale_system_suffix(locale_tag: str) -> str:
-    """Append to system instruction so the model does not default to English."""
+def _pinned_language_rule(locale_tag: str) -> str:
+    """The 'always answer in one locale' rule used when a tag is configured."""
+    name = language_name(locale_tag)
     return (
-        f'\n\nWrite every reply only in the language/locale "{locale_tag}" (BCP-47), '
-        "including join greetings and follow-ups. Do not default to English unless "
-        f'the tag is an English locale (e.g. en-US). If user lines are in another language, '
-        f"still answer in {locale_tag} unless they explicitly ask for a different language."
+        "[OUTPUT LANGUAGE — HIGHEST PRIORITY] Write every assistant message only in "
+        f'{name} (locale "{locale_tag}"). Do not mirror another language from the '
+        "room or from these instructions, even if people speak something else."
     )
+
+
+def language_rule(
+    reply_locale: str | None,
+    spoken_languages: Sequence[str] = DEFAULT_SPOKEN_LANGUAGES,
+) -> str:
+    """Language instruction for the current configuration."""
+    if is_auto_reply_locale(reply_locale):
+        return _mirror_language_rule(spoken_languages)
+    return _pinned_language_rule(str(reply_locale).strip())
 
 
 def format_transcript_user_message(
     transcript_block: str,
     *,
     reply_locale: str | None = None,
+    spoken_languages: Sequence[str] = DEFAULT_SPOKEN_LANGUAGES,
 ) -> str:
     """Build the user turn sent after each reply trigger.
 
@@ -44,23 +110,25 @@ def format_transcript_user_message(
     describing what was said since the bot last spoke.
     """
     block = transcript_block.strip()
-    tag = (reply_locale or "").strip()
     intro = (
         "Here is what people in the voice channel said since your last reply "
         '(each line is "Username: text"). Give a brief spoken reply in '
         "1–2 short sentences that fits naturally in the conversation."
     )
-    if tag:
-        intro = (
-            f'Your reply must be in locale {tag} (BCP-47), same as the '
-            "configured voice session. Do not switch to English or mirror the "
-            "transcript language unless that language is the one for this locale. "
-            + intro
+    if is_auto_reply_locale(reply_locale):
+        closing = (
+            "Answer in the same language as the last line above. Do not switch "
+            "languages and do not mention the language."
         )
-    parts = [intro, "", block]
-    if tag:
-        parts.extend(["", f"End with a reply only in locale {tag}; no other language."])
-    return "\n".join(parts)
+    else:
+        tag = str(reply_locale).strip()
+        name = language_name(tag)
+        intro = (
+            f"Your reply must be in {name} (locale {tag}). Do not mirror the "
+            "transcript language if it differs. " + intro
+        )
+        closing = f"Reply only in {name}; no other language."
+    return "\n".join([intro, "", block, "", closing])
 
 
 def join_greeting_chat_history(greeting_prompt: str, greeting_text: str) -> list[types.Content]:
@@ -71,10 +139,28 @@ def join_greeting_chat_history(greeting_prompt: str, greeting_text: str) -> list
     ]
 
 
+def _greeting_language_instruction(
+    reply_locale: str | None,
+    spoken_languages: Sequence[str],
+) -> str:
+    """Language line for greetings, where there is no speaker turn to mirror yet."""
+    if is_auto_reply_locale(reply_locale):
+        default_name = language_name(
+            spoken_languages[0] if spoken_languages else "en-US"
+        )
+        return (
+            f"Nobody has spoken yet, so greet them in {default_name}. After this, "
+            "switch to whatever language each speaker uses."
+        )
+    tag = str(reply_locale).strip()
+    return f"Write the entire greeting only in {language_name(tag)} (locale {tag})."
+
+
 def format_join_greeting_prompt(
     names_str: str,
     *,
     reply_locale: str | None = None,
+    spoken_languages: Sequence[str] = DEFAULT_SPOKEN_LANGUAGES,
 ) -> str:
     """Build the user turn for the join greeting (first model output in the session)."""
     body = (
@@ -82,21 +168,14 @@ def format_join_greeting_prompt(
         f"Users currently present: {names_str}. "
         "Give a brief, friendly spoken-style hello in 1-2 sentences."
     )
-    tag = (reply_locale or "").strip()
-    if not tag:
-        return body
-    return (
-        f'Write your entire greeting only in the language of locale {tag} (BCP-47). '
-        "Do not use English unless that locale is an English variant (e.g. en-US).\n\n"
-        f"{body}\n\n"
-        f"Reminder: the greeting must be entirely in locale {tag}."
-    )
+    return f"{body}\n\n{_greeting_language_instruction(reply_locale, spoken_languages)}"
 
 
 def format_user_join_greeting_prompt(
     display_name: str,
     *,
     reply_locale: str | None = None,
+    spoken_languages: Sequence[str] = DEFAULT_SPOKEN_LANGUAGES,
 ) -> str:
     """User turn for greeting someone who just connected to the voice channel (by nickname)."""
     name = (display_name or "").strip() or "them"
@@ -105,15 +184,7 @@ def format_user_join_greeting_prompt(
         "Give one brief, friendly spoken-style welcome (1-2 sentences) that feels unique to them "
         f'(use their name naturally — "{name}"). Do not copy a generic template verbatim.'
     )
-    tag = (reply_locale or "").strip()
-    if not tag:
-        return body
-    return (
-        f'Write your entire welcome only in the language of locale {tag} (BCP-47). '
-        "Do not use English unless that locale is an English variant (e.g. en-US).\n\n"
-        f"{body}\n\n"
-        f"Reminder: the welcome must be entirely in locale {tag}."
-    )
+    return f"{body}\n\n{_greeting_language_instruction(reply_locale, spoken_languages)}"
 
 
 class GenAIChatManager:
@@ -129,6 +200,7 @@ class GenAIChatManager:
         api_key: Optional[str] = None,
         *,
         reply_locale: Optional[str] = None,
+        spoken_languages: Sequence[str] = DEFAULT_SPOKEN_LANGUAGES,
     ) -> None:
         """
         Initialize GenAI client.
@@ -136,8 +208,10 @@ class GenAIChatManager:
         Args:
             api_key: Gemini API key (optional, reads GOOGLE_GEMINI_API_KEY if
                 not provided)
-            reply_locale: BCP-47 tag (e.g. en-US) for spoken replies; aligns with
-                ``stt.language_code`` in settings when passed from the orchestrator.
+            reply_locale: BCP-47 tag (e.g. en-US) to pin every reply to one
+                language, or ``"auto"`` to mirror whatever each speaker used.
+            spoken_languages: Languages expected in the channel; used to tell the
+                model which ones to switch between in ``"auto"`` mode.
         """
         resolved = api_key or os.getenv("GOOGLE_GEMINI_API_KEY")
         if not resolved:
@@ -149,7 +223,16 @@ class GenAIChatManager:
         self.current_persona: Optional[Persona] = None
         self.usage_counters = UsageCounters()
         self._reply_locale = (reply_locale or "").strip() or None
-        logger.info("GenAIChatManager initialized")
+        self._spoken_languages = tuple(spoken_languages) or DEFAULT_SPOKEN_LANGUAGES
+        logger.info(
+            "GenAIChatManager initialized (reply language: %s)",
+            self._reply_locale or "auto",
+        )
+
+    @property
+    def spoken_languages(self) -> tuple[str, ...]:
+        """Languages the companion expects to hear and answer in."""
+        return self._spoken_languages
 
     def _accumulate_usage(self, response: Any) -> None:
         usage = getattr(response, "usage_metadata", None)
@@ -186,14 +269,12 @@ class GenAIChatManager:
             history: Optional prior turns (e.g. join greeting) for multiturn context.
         """
         self.current_persona = persona
-        system_instruction = persona.system_instruction or ""
-        if self._reply_locale:
-            system_instruction = (
-                _reply_locale_system_prefix(self._reply_locale)
-                + system_instruction
-                + _reply_locale_system_suffix(self._reply_locale)
-            )
-            logger.info("GenAI system instruction includes reply locale %s", self._reply_locale)
+        rule = language_rule(self._reply_locale, self._spoken_languages)
+        # The language rule brackets the persona so it outranks both the persona's
+        # own tone and any language the transcript happens to be dominated by.
+        system_instruction = "\n\n".join(
+            part for part in (rule, persona.system_instruction or "", rule) if part
+        )
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=0.65,
@@ -227,6 +308,64 @@ class GenAIChatManager:
         logger.debug("Received reply (%s chars)", len(reply))
         return reply
 
+    async def should_volunteer(
+        self,
+        transcript_text: str,
+        *,
+        model: str | None = None,
+    ) -> bool:
+        """Decide whether an unprompted interjection is actually worth making.
+
+        Runs as a standalone one-token call rather than a chat turn, so declined
+        interjections leave no trace in the conversation history. This is what
+        makes a high talkativeness setting usable: the timing dial decides *how
+        often the bot considers speaking*, and this decides *whether it should*.
+        """
+        block = transcript_text.strip()
+        if not block:
+            return False
+
+        persona_name = (
+            self.current_persona.display_name if self.current_persona else "the assistant"
+        )
+        prompt = (
+            f"You are {persona_name}, sitting in a Discord voice call. Nobody "
+            "addressed you directly. Here is what was just said:\n\n"
+            f"{block}\n\n"
+            "Would joining in right now add something the others would actually "
+            "want to hear - answering an open question, catching a mistake, or a "
+            "genuinely fitting remark? Interrupting a flowing conversation with "
+            "filler, agreement or small talk is not worth it.\n"
+            'Answer with exactly one word: "YES" or "NO".'
+        )
+        gate_model = model or (
+            self.current_persona.genai_model if self.current_persona else "gemini-2.5-flash"
+        )
+
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=gate_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=4,
+                    system_instruction=(
+                        "You gate an AI companion's unprompted interjections. "
+                        "Reply with YES or NO and nothing else. When unsure, say NO."
+                    ),
+                ),
+            )
+        except Exception as exc:
+            # Staying quiet is the safe failure mode for an uninvited remark.
+            logger.warning("Volunteer gate failed (%s); staying quiet.", exc)
+            return False
+
+        self._accumulate_usage(response)
+        verdict = (getattr(response, "text", None) or "").strip().upper()
+        decision = verdict.startswith("YES")
+        logger.info("Volunteer gate: %s -> %s", verdict or "(empty)", decision)
+        return decision
+
     async def count_tokens(self, text: str) -> int:
         """
         Rough character-based estimate (optional; preflight counting is SDK-specific).
@@ -246,7 +385,11 @@ class GenAIChatManager:
 
     def format_conversation_prompt(self, transcript_text: str) -> str:
         """Format merged transcript into the user message for the model."""
-        return format_transcript_user_message(transcript_text, reply_locale=self._reply_locale)
+        return format_transcript_user_message(
+            transcript_text,
+            reply_locale=self._reply_locale,
+            spoken_languages=self._spoken_languages,
+        )
 
     def end_chat_session(self) -> None:
         """End current chat session."""

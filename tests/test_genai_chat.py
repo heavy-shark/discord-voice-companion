@@ -11,6 +11,8 @@ from src.conversation.chat import (
     format_join_greeting_prompt,
     format_transcript_user_message,
     join_greeting_chat_history,
+    language_name,
+    language_rule,
 )
 from src.models import Persona
 from src.storage.settings import repair_utf8_mojibake
@@ -114,10 +116,113 @@ def test_format_join_greeting_prompt_requires_locale() -> None:
     assert "Discord voice channel" in out
 
 
-def test_format_join_greeting_prompt_secondary_locale_uses_english_instructions() -> None:
+def test_format_join_greeting_prompt_names_the_pinned_language() -> None:
     out = format_join_greeting_prompt("A", reply_locale="de-DE")
     assert "de-DE" in out
-    assert "Do not use English" in out
+    assert "German" in out
+
+
+def test_auto_locale_greets_in_the_first_spoken_language() -> None:
+    """Nobody has spoken yet, so there is no speaker turn to mirror."""
+    out = format_join_greeting_prompt(
+        "A", reply_locale="auto", spoken_languages=("uk-UA", "ru-RU", "en-US")
+    )
+    assert "Ukrainian" in out
+    assert "switch to whatever language each speaker uses" in out
+
+
+def test_auto_locale_transcript_prompt_asks_to_mirror_the_last_speaker() -> None:
+    out = format_transcript_user_message("Alice: як справи", reply_locale="auto")
+    assert "Alice: як справи" in out
+    assert "same language as the last line" in out
+
+
+def test_auto_language_rule_lists_every_spoken_language() -> None:
+    rule = language_rule("auto", ("uk-UA", "ru-RU", "en-US"))
+    assert "Ukrainian, Russian or English" in rule
+    assert "never default to english" in rule.lower()
+
+
+def test_pinned_language_rule_names_the_locale() -> None:
+    rule = language_rule("uk-UA")
+    assert "Ukrainian" in rule
+    assert "uk-UA" in rule
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [("uk-UA", "Ukrainian"), ("ru", "Russian"), ("en-GB", "English"), ("xx-YY", "xx-YY")],
+)
+def test_language_name_maps_tags_to_readable_names(tag: str, expected: str) -> None:
+    assert language_name(tag) == expected
+
+
+@pytest.mark.asyncio
+async def test_system_instruction_brackets_the_persona_with_the_language_rule(
+    sample_persona: Persona,
+) -> None:
+    """The rule must outrank the persona, so it is repeated after it too."""
+    fake_aio = MagicMock()
+    fake_aio.chats = MagicMock()
+    fake_aio.chats.create = MagicMock(return_value=AsyncMock())
+    fake_client = MagicMock()
+    fake_client.aio = fake_aio
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")  # defaults to auto
+        await mgr.create_chat_session(sample_persona)
+
+    si = fake_aio.chats.create.call_args.kwargs["config"].system_instruction
+    assert si.startswith("[OUTPUT LANGUAGE")
+    assert si.count("[OUTPUT LANGUAGE") == 2
+    assert "You are a test bot." in si
+
+
+@pytest.mark.asyncio
+async def test_should_volunteer_returns_true_only_on_yes(sample_persona: Persona) -> None:
+    fake_models = MagicMock()
+    fake_models.generate_content = AsyncMock(
+        return_value=MagicMock(text="YES", usage_metadata=None)
+    )
+    fake_aio = MagicMock()
+    fake_aio.models = fake_models
+    fake_aio.chats = MagicMock()
+    fake_aio.chats.create = MagicMock(return_value=AsyncMock())
+    fake_client = MagicMock()
+    fake_client.aio = fake_aio
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")
+        await mgr.create_chat_session(sample_persona)
+        assert await mgr.should_volunteer("Alice: what time is it?") is True
+
+        fake_models.generate_content = AsyncMock(
+            return_value=MagicMock(text="NO", usage_metadata=None)
+        )
+        assert await mgr.should_volunteer("Alice: haha yeah") is False
+
+
+@pytest.mark.asyncio
+async def test_should_volunteer_stays_quiet_on_empty_input_or_failure(
+    sample_persona: Persona,
+) -> None:
+    fake_models = MagicMock()
+    fake_models.generate_content = AsyncMock(side_effect=RuntimeError("rate limited"))
+    fake_aio = MagicMock()
+    fake_aio.models = fake_models
+    fake_aio.chats = MagicMock()
+    fake_aio.chats.create = MagicMock(return_value=AsyncMock())
+    fake_client = MagicMock()
+    fake_client.aio = fake_aio
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")
+        await mgr.create_chat_session(sample_persona)
+        # Nothing to react to: never even asks.
+        assert await mgr.should_volunteer("   ") is False
+        fake_models.generate_content.assert_not_awaited()
+        # Gate unreachable: silence is the safe default for an uninvited remark.
+        assert await mgr.should_volunteer("Alice: hmm") is False
 
 
 def test_repair_utf8_mojibake_scandinavian_chars() -> None:
@@ -157,7 +262,7 @@ async def test_create_chat_session_passes_history(sample_persona: Persona) -> No
     assert len(kw["history"]) == 2
 
 
-def test_format_join_greeting_prompt_without_locale() -> None:
+def test_format_join_greeting_prompt_without_locale_falls_back_to_auto() -> None:
     out = format_join_greeting_prompt("(none)", reply_locale=None)
     assert "Discord voice channel" in out
     assert "(none)" in out

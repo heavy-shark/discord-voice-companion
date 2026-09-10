@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
 from typing import cast
 
 from rich.markup import escape
@@ -20,32 +18,20 @@ from ..conversation import (
     GenAIChatManager,
     PersonaManager,
     ReplyTriggerPolicy,
+    TriggerReason,
 )
 from ..conversation.chat import format_join_greeting_prompt, format_user_join_greeting_prompt
 from ..discord import DiscordAudioSink, DiscordClient, VoicePlaybackManager
 from ..models import AudioFrame, Persona, TranscriptSegment
-from ..runtime_ffmpeg import probe_audio_duration_seconds
-from ..storage import DEFAULT_STT_LANGUAGE_CODE, SettingsStore, TranscriptSessionWriter
+from ..storage import SettingsStore, TranscriptSessionWriter
 from ..storage.transcripts import attach_active_transcript_writer, detach_active_transcript_writer
-from ..transcription import GoogleSTTClient, PerUserTranscriptionCoordinator
+from ..transcription import GeminiSTTClient, PerUserTranscriptionCoordinator
 from ..tts import ElevenLabsTTSClient
 from .metrics import SessionMetrics
 
 logger = logging.getLogger(__name__)
 
 _DISCORD_NICKNAME_MAX_LEN = 32
-
-
-def _unlink_temp_file(path: Path) -> None:
-    """Delete a temp file; retry briefly on Windows when the file is still locked."""
-    for _ in range(20):
-        try:
-            path.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            time.sleep(0.05)
-    with suppress(PermissionError):
-        path.unlink(missing_ok=True)
 
 
 def _persona_mention_trigger_sources(persona: Persona) -> list[str]:
@@ -84,11 +70,15 @@ class ConversationRunnerConfig:
     """Behavior knobs resolved from env / caller (keep runner free of dotenv)."""
 
     stt_idle_timeout_seconds: float
-    reply_silence_seconds: float
-    reply_cooldown_seconds: float
     mention_window_seconds: float
     greet_on_join: bool
     reply_locale: str
+    talkativeness: int
+    spoken_languages: tuple[str, ...]
+    # ``None`` means "derive from talkativeness"; set to override the dial.
+    reply_silence_seconds: float | None = None
+    reply_cooldown_seconds: float | None = None
+    barge_in: bool = True
 
 
 async def _wait_session_runtime(
@@ -157,36 +147,33 @@ async def run_voice_conversation(
         metrics.guild_label = getattr(guild, "name", "") or ""
         metrics.channel_label = getattr(channel, "name", "") or ""
 
+    gemini_api_key = settings_store.resolve_api_secret(
+        "google_gemini_api_key",
+        "GOOGLE_GEMINI_API_KEY",
+    )
+
     chat_manager = GenAIChatManager(
-        api_key=settings_store.resolve_api_secret(
-            "google_gemini_api_key",
-            "GOOGLE_GEMINI_API_KEY",
-        ),
+        api_key=gemini_api_key,
         reply_locale=runner_config.reply_locale,
+        spoken_languages=runner_config.spoken_languages,
     )
 
     policy = ReplyTriggerPolicy(
         silence_timeout_seconds=runner_config.reply_silence_seconds,
         cooldown_seconds=runner_config.reply_cooldown_seconds,
         mention_window_seconds=runner_config.mention_window_seconds,
+        talkativeness=runner_config.talkativeness,
     )
     policy.set_mention_triggers(_persona_mention_trigger_sources(persona))
 
     conversation_log = ConversationLog()
-    stt_config = settings_store.get_stt_config()
-    stt_primary_language = (
-        str(stt_config.get("language_code", DEFAULT_STT_LANGUAGE_CODE)).strip()
-        or DEFAULT_STT_LANGUAGE_CODE
-    )
-    stt_client = GoogleSTTClient(
-        primary_language=stt_primary_language,
-        alternative_languages=stt_config.get("alternative_language_codes", ["en-US"]),
-        api_key=settings_store.resolve_stt_api_key(),
-        project_id=settings_store.resolve_stt_project_id(),
-        location=settings_store.resolve_stt_location(),
-        model=settings_store.resolve_stt_model(),
-        credentials_path=settings_store.resolve_stt_credentials_path(),
-        speech_backend=settings_store.resolve_stt_speech_backend(),
+    stt_client = GeminiSTTClient(
+        gemini_api_key or "",
+        backend=settings_store.resolve_stt_backend(),
+        live_model=settings_store.resolve_stt_live_model(),
+        batch_model=settings_store.resolve_stt_batch_model(),
+        language_hints=settings_store.resolve_stt_language_hints(),
+        emit_interim=settings_store.resolve_stt_emit_interim(),
     )
     await stt_client.validate_connectivity()
 
@@ -211,40 +198,41 @@ async def run_voice_conversation(
             metrics.total_tokens = total
 
     async def speak_bot_text(text: str, active_persona: Persona) -> None:
+        """Synthesize and play a reply, streaming so it starts before it is finished."""
         stripped = (text or "").strip()
         if not stripped:
             logger.info("Skipping TTS for empty bot text.")
             return
         if metrics is not None:
             metrics.append_transcript_line(f"[b]Bot[/b]: {escape(stripped)}")
+            metrics.status_line = "speaking"
+
+        played_seconds = await playback_manager.play_mono_pcm_stream(
+            tts_client.stream_pcm(stripped, active_persona)
+        )
+
+        tts_client.record_tts_duration(played_seconds)
+        transcript_writer.add_tts_seconds(played_seconds)
+        char_count = len(stripped)
+        tts_client.record_tts_characters(char_count)
+        transcript_writer.add_tts_characters(char_count)
         if metrics is not None:
-            metrics.status_line = "synthesizing speech"
-        audio_path = await tts_client.synthesize_to_file(stripped, active_persona)
-        try:
-            if metrics is not None:
-                metrics.status_line = "playing audio"
-            await playback_manager.play_file(Path(audio_path))
-            try:
-                duration_seconds = float(probe_audio_duration_seconds(audio_path))
-                tts_client.record_tts_duration(duration_seconds)
-                transcript_writer.add_tts_seconds(duration_seconds)
-            except Exception as exc:
-                logger.warning("TTS duration probe failed: %s", exc)
-            char_count = len(stripped)
-            tts_client.record_tts_characters(char_count)
-            transcript_writer.add_tts_characters(char_count)
-            if metrics is not None:
-                metrics.tts_characters += char_count
-                inp, out = chat_manager.get_token_usage_breakdown()
-                metrics.genai_input_tokens = inp
-                metrics.genai_output_tokens = out
-                metrics.total_tokens = inp + out
-        finally:
-            _unlink_temp_file(Path(audio_path))
+            metrics.tts_characters += char_count
+            inp, out = chat_manager.get_token_usage_breakdown()
+            metrics.genai_input_tokens = inp
+            metrics.genai_output_tokens = out
+            metrics.total_tokens = inp + out
 
     audio_queue: asyncio.Queue[AudioFrame] = asyncio.Queue()
 
     def handle_final_segment(segment: TranscriptSegment) -> None:
+        # Interim hypotheses are for the dashboard only; they must not reach the
+        # conversation log or the reply policy or the bot answers half-sentences.
+        if not segment.is_final:
+            if metrics is not None:
+                metrics.status_line = f"hearing: {segment.username}"
+            return
+
         conversation_log.add_segment(segment)
         transcript_writer.add_segment(segment)
         policy.record_human_speech()
@@ -264,11 +252,22 @@ async def run_voice_conversation(
         if metrics is not None:
             metrics.add_stt_seconds(delta)
 
+    def on_speech_started(user_id: int, username: str) -> None:
+        """Cut the bot off when a human starts talking over it."""
+        policy.record_human_speech()
+        if not runner_config.barge_in or not playback_manager.is_playing():
+            return
+        logger.info("Barge-in: %s started speaking; stopping playback.", username)
+        if metrics is not None:
+            metrics.status_line = f"interrupted by {username}"
+        asyncio.create_task(playback_manager.stop_playback(), name="barge-in-stop")
+
     coordinator = PerUserTranscriptionCoordinator(
         stt_client=stt_client,
         segment_handler=handle_final_segment,
         idle_timeout_seconds=runner_config.stt_idle_timeout_seconds,
         on_stt_audio_seconds=on_stt_audio_seconds,
+        on_speech_started=on_speech_started,
     )
     consumer_stop_event = asyncio.Event()
     consumer_task = asyncio.create_task(
@@ -296,6 +295,7 @@ async def run_voice_conversation(
             greeting_prompt = format_join_greeting_prompt(
                 names_str,
                 reply_locale=runner_config.reply_locale,
+                spoken_languages=runner_config.spoken_languages,
             )
             await chat_manager.create_chat_session(persona)
             greeting = await chat_manager.send_message(greeting_prompt)
@@ -341,38 +341,37 @@ async def run_voice_conversation(
                     if not supervisor_stop["go"] or consumer_stop_event.is_set():
                         break
                     pending = conversation_log.has_pending_since_bot()
-                    if not policy.should_trigger_reply(has_pending_transcript=pending):
+                    decision = policy.evaluate(has_pending_transcript=pending)
+                    reason = decision.reason
+                    if not decision.should_reply or reason is None:
                         continue
-                    logger.info("Reply trigger fired; pausing voice receive for GenAI.")
+
+                    transcript_block = conversation_log.get_conversation_for_prompt()
+
+                    # Nobody addressed the bot: ask whether this is worth saying
+                    # before spending a full reply on it.
+                    if reason is TriggerReason.VOLUNTEERED:
+                        if metrics is not None:
+                            metrics.status_line = "deciding whether to chime in"
+                        if not await chat_manager.should_volunteer(transcript_block):
+                            policy.record_declined_reply()
+                            continue
+
+                    logger.info("Reply trigger fired (%s).", reason.value)
                     if metrics is not None:
                         metrics.status_line = "generating reply"
-                    if discord_client.is_listening():
-                        await discord_client.stop_listening()
-                    try:
-                        prompt = chat_manager.format_conversation_prompt(
-                            conversation_log.get_conversation_for_prompt()
-                        )
-                        reply = await chat_manager.send_message(prompt)
-                        conversation_log.add_bot_turn(reply)
-                        policy.record_bot_reply()
-                        transcript_writer.add_bot_reply(reply, label="reply")
-                        bump_metrics_tokens()
-                        logger.info("Bot reply | %s", reply)
-                        await speak_bot_text(reply, persona)
-                    finally:
-                        if (
-                            supervisor_stop["go"]
-                            and not consumer_stop_event.is_set()
-                            and getattr(voice_client, "is_connected", lambda: False)()
-                            and not discord_client.is_listening()
-                        ):
-                            resume_sink = DiscordAudioSink(
-                                audio_queue=audio_queue,
-                                loop=asyncio.get_running_loop(),
-                                use_opus=False,
-                                user_audio_allowed=user_audio_allowed,
-                            )
-                            await discord_client.start_listening(resume_sink)
+
+                    # Voice receive stays on throughout: the bot keeps hearing the
+                    # room while it thinks and speaks, which is what makes
+                    # barge-in and follow-up context work.
+                    prompt = chat_manager.format_conversation_prompt(transcript_block)
+                    reply = await chat_manager.send_message(prompt)
+                    conversation_log.add_bot_turn(reply)
+                    policy.record_bot_reply()
+                    transcript_writer.add_bot_reply(reply, label=reason.value)
+                    bump_metrics_tokens()
+                    logger.info("Bot reply | %s", reply)
+                    await speak_bot_text(reply, persona)
 
         async def on_voice_user_joined(member: discord.Member) -> None:
             display_name = (
@@ -382,6 +381,7 @@ async def run_voice_conversation(
             greeting_prompt = format_user_join_greeting_prompt(
                 display_name,
                 reply_locale=runner_config.reply_locale,
+                spoken_languages=runner_config.spoken_languages,
             )
             async with reply_lock:
                 if consumer_stop_event.is_set() or not supervisor_stop["go"]:
@@ -389,31 +389,14 @@ async def run_voice_conversation(
                 logger.info("User join greeting for %s", display_name)
                 if metrics is not None:
                     metrics.status_line = "user join greeting"
-                if discord_client.is_listening():
-                    await discord_client.stop_listening()
-                try:
-                    await playback_manager.stop_playback()
-                    greeting = await chat_manager.send_message(greeting_prompt)
-                    conversation_log.add_bot_turn(greeting)
-                    policy.record_bot_reply()
-                    transcript_writer.add_bot_reply(greeting, label="greeting_join_user")
-                    bump_metrics_tokens()
-                    logger.info("User join greeting | %s", greeting)
-                    await speak_bot_text(greeting, persona)
-                finally:
-                    if (
-                        supervisor_stop["go"]
-                        and not consumer_stop_event.is_set()
-                        and getattr(voice_client, "is_connected", lambda: False)()
-                        and not discord_client.is_listening()
-                    ):
-                        resume_sink = DiscordAudioSink(
-                            audio_queue=audio_queue,
-                            loop=asyncio.get_running_loop(),
-                            use_opus=False,
-                            user_audio_allowed=user_audio_allowed,
-                        )
-                        await discord_client.start_listening(resume_sink)
+                await playback_manager.stop_playback()
+                greeting = await chat_manager.send_message(greeting_prompt)
+                conversation_log.add_bot_turn(greeting)
+                policy.record_bot_reply()
+                transcript_writer.add_bot_reply(greeting, label="greeting_join_user")
+                bump_metrics_tokens()
+                logger.info("User join greeting | %s", greeting)
+                await speak_bot_text(greeting, persona)
 
         logger.info(
             "Starting conversation mode in channel %s (%s)%s",

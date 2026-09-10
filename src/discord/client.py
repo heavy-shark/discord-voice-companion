@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[..., discord.Client]
 
+# Called with the freshly built CommandTree so callers can add their own commands
+# alongside the consent ones. Runs before the tree is synced.
+CommandRegistrar = Callable[[app_commands.CommandTree], None]
+
 _GATEWAY_RETRY_ATTEMPTS = 5
 _GATEWAY_RETRY_BASE_SECONDS = 2.0
 
@@ -77,12 +81,14 @@ class DiscordClient:
         client_factory: ClientFactory = discord.Client,
         consent_store: ConsentStore | None = None,
         app_command_sync_guild_id: int | None = None,
+        command_registrars: list[CommandRegistrar] | None = None,
     ) -> None:
         """Initialize the Discord gateway wrapper."""
         self.token = token
         self._client_factory = client_factory
         self.consent_store = consent_store or ConsentStore()
         self._app_command_sync_guild_id = app_command_sync_guild_id
+        self._command_registrars: list[CommandRegistrar] = list(command_registrars or [])
         self.client: Optional[discord.Client] = None
         self.voice_client: Optional[VoiceRecvClient] = None
         self._ready_event = asyncio.Event()
@@ -97,6 +103,10 @@ class DiscordClient:
         self.last_app_command_sync_summary: str = ""
         apply_discord_ext_voice_recv_patches()
         logger.info("DiscordClient initialized")
+
+    def add_command_registrar(self, registrar: CommandRegistrar) -> None:
+        """Register extra slash commands. Must be called before :meth:`connect`."""
+        self._command_registrars.append(registrar)
 
     def set_activity_log_sink(self, sink: Callable[[str], None] | None) -> None:
         """Optional callback for slash-command / consent events (e.g. Textual activity log)."""
@@ -139,6 +149,8 @@ class DiscordClient:
                 self.consent_store,
                 activity_sink=self._emit_activity,
             )
+            for registrar in self._command_registrars:
+                registrar(tree)
             self._command_tree = tree
         else:
             self._command_tree = None

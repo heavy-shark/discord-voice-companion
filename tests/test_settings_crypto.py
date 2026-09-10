@@ -43,8 +43,6 @@ def test_save_writes_encrypted_when_env_key_set(tmp_path: Path) -> None:
         store = SettingsStore(settings_path=path)
         store.set_api_config(
             google_gemini_api_key="k1",
-            google_stt_api_key="k2",
-            google_stt_project_id="",
             elevenlabs_api_key="k3",
         )
         store.set_discord_config(token="dt", server_id="")
@@ -114,8 +112,6 @@ def test_save_api_keys_creates_local_key_file_without_env(
     store = SettingsStore(settings_path=path)
     store.set_api_config(
         google_gemini_api_key="k1",
-        google_stt_api_key="k2",
-        google_stt_project_id="",
         elevenlabs_api_key="k3",
     )
     assert store.save() is True

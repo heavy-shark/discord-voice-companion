@@ -13,7 +13,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Sequence
 
-from src.conversation import ConversationLog
+from src.conversation import DEFAULT_TALKATIVENESS, ConversationLog
 from src.discord import DiscordAudioSink, DiscordClient, VoicePlaybackManager
 from src.discord.preflight import (
     PreflightError,
@@ -23,25 +23,49 @@ from src.discord.preflight import (
 from src.models import AudioFrame
 from src.runtime_dirs import app_bundle_dir, load_application_dotenv
 from src.session import ConversationRunnerConfig, run_voice_conversation
-from src.storage import DEFAULT_STT_LANGUAGE_CODE, SettingsStore, TranscriptSessionWriter
+from src.storage import (
+    DEFAULT_STT_LANGUAGE_HINTS,
+    SettingsStore,
+    TranscriptSessionWriter,
+)
 from src.storage.reply_locale import resolve_bot_reply_language_code
-from src.transcription import GoogleSTTClient, PerUserTranscriptionCoordinator
+from src.transcription import GeminiSTTClient, PerUserTranscriptionCoordinator
 from src.tts import resolve_elevenlabs_api_key
 
 logger = logging.getLogger(__name__)
 
 
-def voice_user_audio_allowed(discord_client: DiscordClient) -> Callable[[int], bool]:
-    """Return a sink predicate: only consented users (and never the bot) send audio to STT."""
+def resolve_require_consent(settings_store: SettingsStore | None = None) -> bool:
+    """Whether each speaker must run ``/consent accept`` before being transcribed.
+
+    Defaults to off. With it on, a freshly invited bot hears nobody until every
+    participant runs a slash command, which reads as "the bot is broken". Turn it
+    on for servers where you need recorded proof of disclosure; the join notice
+    tells the channel what is happening either way.
+    """
+    if settings_store is not None:
+        return settings_store.resolve_runtime_bool(
+            "require_consent", "BOT_REQUIRE_CONSENT", default=False
+        )
+    raw = os.getenv("BOT_REQUIRE_CONSENT", "false").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def voice_user_audio_allowed(
+    discord_client: DiscordClient,
+    *,
+    require_consent: bool = True,
+) -> Callable[[int], bool]:
+    """Return a sink predicate deciding whose audio reaches transcription."""
     inner = getattr(discord_client, "client", None)
     bot_user = getattr(inner, "user", None) if inner is not None else None
     bot_id = getattr(bot_user, "id", None) if bot_user is not None else None
     store = getattr(discord_client, "consent_store", None)
-    if store is None:
 
-        def allow_all(_user_id: int) -> bool:
-            return True
+    def allow_all(_user_id: int) -> bool:
+        return True
 
+    if store is None or not require_consent:
         return allow_all
 
     def allowed(user_id: int) -> bool:
@@ -50,6 +74,24 @@ def voice_user_audio_allowed(discord_client: DiscordClient) -> Callable[[int], b
         return store.is_consented(user_id)
 
     return allowed
+
+
+def resolve_auto_join_channel_id(settings_store: SettingsStore | None = None) -> int | None:
+    """Voice channel to join at startup, or ``None`` to wait for ``/join``."""
+    raw = ""
+    if settings_store is not None:
+        raw = str(settings_store.get_runtime_config().get("voice_channel_id", "")).strip()
+    if not raw:
+        raw = os.getenv("DISCORD_VOICE_CHANNEL_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"DISCORD_VOICE_CHANNEL_ID must be a number, got {raw!r}. "
+            "Leave it empty to use the /join command instead."
+        ) from None
 
 
 def configure_logging() -> None:
@@ -228,26 +270,70 @@ def _parse_positive_float_env(name: str, default: float) -> float:
     return value
 
 
-def resolve_reply_silence_seconds(settings_store: SettingsStore | None = None) -> float:
-    """Seconds of silence before a non-mention reply can trigger."""
+def _optional_positive_float(
+    settings_store: SettingsStore | None,
+    settings_key: str,
+    env_name: str,
+) -> float | None:
+    """A timing override, or ``None`` to let talkativeness decide it."""
     if settings_store is not None:
-        return settings_store.resolve_runtime_float(
-            "reply_silence_seconds",
-            "BOT_REPLY_SILENCE_SECONDS",
-            5.0,
-        )
-    return _parse_positive_float_env("BOT_REPLY_SILENCE_SECONDS", 5.0)
+        raw = settings_store.get_runtime_config().get(settings_key)
+        if raw not in (None, ""):
+            try:
+                return float(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{settings_key} must be a number.") from exc
+    env_value = os.getenv(env_name)
+    if env_value is None or not env_value.strip():
+        return None
+    return _parse_positive_float_env(env_name, 0.0)
 
 
-def resolve_reply_cooldown_seconds(settings_store: SettingsStore | None = None) -> float:
-    """Minimum seconds between bot replies after the last spoken reply."""
+def resolve_reply_silence_seconds(
+    settings_store: SettingsStore | None = None,
+) -> float | None:
+    """Silence gap before a reply can trigger, or ``None`` to derive from talkativeness."""
+    return _optional_positive_float(
+        settings_store, "reply_silence_seconds", "BOT_REPLY_SILENCE_SECONDS"
+    )
+
+
+def resolve_reply_cooldown_seconds(
+    settings_store: SettingsStore | None = None,
+) -> float | None:
+    """Minimum gap between replies, or ``None`` to derive from talkativeness."""
+    return _optional_positive_float(
+        settings_store, "reply_cooldown_seconds", "BOT_REPLY_COOLDOWN_SECONDS"
+    )
+
+
+def resolve_talkativeness(settings_store: SettingsStore | None = None) -> int:
+    """How eagerly the bot joins in, 0-100 (0 = only answers when addressed)."""
     if settings_store is not None:
-        return settings_store.resolve_runtime_float(
-            "reply_cooldown_seconds",
-            "BOT_REPLY_COOLDOWN_SECONDS",
-            180.0,
+        value = settings_store.resolve_runtime_float(
+            "talkativeness",
+            "BOT_TALKATIVENESS",
+            float(DEFAULT_TALKATIVENESS),
         )
-    return _parse_positive_float_env("BOT_REPLY_COOLDOWN_SECONDS", 180.0)
+    else:
+        value = _parse_positive_float_env("BOT_TALKATIVENESS", float(DEFAULT_TALKATIVENESS))
+    return max(0, min(100, int(round(value))))
+
+
+def resolve_spoken_languages(settings_store: SettingsStore | None = None) -> tuple[str, ...]:
+    """Languages the companion expects to hear and answer in."""
+    if settings_store is None:
+        return DEFAULT_STT_LANGUAGE_HINTS
+    hints = settings_store.resolve_stt_language_hints()
+    return tuple(hints) if hints else DEFAULT_STT_LANGUAGE_HINTS
+
+
+def resolve_barge_in(settings_store: SettingsStore | None = None) -> bool:
+    """Whether a human talking over the bot cuts its playback short."""
+    if settings_store is not None:
+        return settings_store.resolve_runtime_bool("barge_in", "BOT_BARGE_IN", default=True)
+    raw = os.getenv("BOT_BARGE_IN", "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def resolve_mention_window_seconds(settings_store: SettingsStore | None = None) -> float:
@@ -372,17 +458,15 @@ async def run_transcription_mode(
 ) -> None:
     """Run transcription until interrupted or the optional time window elapses."""
     settings_store = settings_store or SettingsStore()
-    stt_config = settings_store.get_stt_config()
     conversation_log = ConversationLog()
-    stt_client = GoogleSTTClient(
-        primary_language=stt_config.get("language_code", DEFAULT_STT_LANGUAGE_CODE),
-        alternative_languages=stt_config.get("alternative_language_codes", ["en-US"]),
-        api_key=settings_store.resolve_stt_api_key(),
-        project_id=settings_store.resolve_stt_project_id(),
-        location=settings_store.resolve_stt_location(),
-        model=settings_store.resolve_stt_model(),
-        credentials_path=settings_store.resolve_stt_credentials_path(),
-        speech_backend=settings_store.resolve_stt_speech_backend(),
+    stt_client = GeminiSTTClient(
+        settings_store.resolve_api_secret("google_gemini_api_key", "GOOGLE_GEMINI_API_KEY")
+        or "",
+        backend=settings_store.resolve_stt_backend(),
+        live_model=settings_store.resolve_stt_live_model(),
+        batch_model=settings_store.resolve_stt_batch_model(),
+        language_hints=settings_store.resolve_stt_language_hints(),
+        emit_interim=settings_store.resolve_stt_emit_interim(),
     )
     await stt_client.validate_connectivity()
 
@@ -397,6 +481,9 @@ async def run_transcription_mode(
     audio_queue: asyncio.Queue[AudioFrame] = asyncio.Queue()
 
     def handle_final_segment(segment) -> None:
+        if not segment.is_final:
+            logger.debug("Interim | %s: %s", segment.username, segment.text)
+            return
         conversation_log.add_segment(segment)
         transcript_writer.add_segment(segment)
         logger.info("Final transcript | %s: %s", segment.username, segment.text)
@@ -504,11 +591,14 @@ async def run_async(args: Namespace) -> None:
             )
             runner_config = ConversationRunnerConfig(
                 stt_idle_timeout_seconds=resolve_stt_idle_timeout_seconds(),
-                reply_silence_seconds=resolve_reply_silence_seconds(settings_store),
-                reply_cooldown_seconds=resolve_reply_cooldown_seconds(settings_store),
                 mention_window_seconds=resolve_mention_window_seconds(settings_store),
                 greet_on_join=resolve_greet_on_join(settings_store),
                 reply_locale=resolve_bot_reply_language_code(settings_store),
+                talkativeness=resolve_talkativeness(settings_store),
+                spoken_languages=resolve_spoken_languages(settings_store),
+                reply_silence_seconds=resolve_reply_silence_seconds(settings_store),
+                reply_cooldown_seconds=resolve_reply_cooldown_seconds(settings_store),
+                barge_in=resolve_barge_in(settings_store),
             )
             await run_voice_conversation(
                 discord_client=discord_client,

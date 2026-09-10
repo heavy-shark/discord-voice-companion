@@ -10,13 +10,14 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from ..models import AudioFrame, TranscriptSegment
+from .gemini_stt import GeminiSTTClient
 from .preprocessing import convert_to_linear16
-from .stt import GoogleSTTV1Client, GoogleSTTV2Client
 
 logger = logging.getLogger(__name__)
 
 SegmentHandler = Callable[[TranscriptSegment], object]
 SttAudioSecondsHandler = Callable[[float], None]
+SpeechStartHandler = Callable[[int, str], None]
 
 
 @dataclass(slots=True)
@@ -37,13 +38,14 @@ class PerUserTranscriptionCoordinator:
 
     def __init__(
         self,
-        stt_client: GoogleSTTV1Client | GoogleSTTV2Client,
+        stt_client: GeminiSTTClient,
         segment_handler: SegmentHandler,
         *,
         idle_timeout_seconds: float = 0.5,
         poll_interval_seconds: float = 0.1,
         target_sample_rate_hz: int = 16000,
         on_stt_audio_seconds: SttAudioSecondsHandler | None = None,
+        on_speech_started: SpeechStartHandler | None = None,
     ) -> None:
         self.stt_client = stt_client
         self.segment_handler = segment_handler
@@ -51,6 +53,7 @@ class PerUserTranscriptionCoordinator:
         self.poll_interval_seconds = poll_interval_seconds
         self.target_sample_rate_hz = target_sample_rate_hz
         self._on_stt_audio_seconds = on_stt_audio_seconds
+        self._on_speech_started = on_speech_started
         self._active_sessions: dict[int, _UtteranceSession] = {}
         self._all_tasks: set[asyncio.Task[None]] = set()
         self._worker_error: BaseException | None = None
@@ -162,6 +165,13 @@ class PerUserTranscriptionCoordinator:
         )
         self._active_sessions[frame.user_id] = session
         logger.debug("Started STT utterance for %s (%s)", frame.username, frame.user_id)
+        if self._on_speech_started is not None:
+            # Fires as soon as someone starts talking, well before their words are
+            # transcribed - early enough to cut the bot off mid-sentence.
+            try:
+                self._on_speech_started(frame.user_id, frame.username)
+            except Exception:
+                logger.warning("on_speech_started handler failed", exc_info=True)
         return session
 
     async def _close_session(self, user_id: int) -> None:

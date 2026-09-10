@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Optional
 
 import discord
 
 from ..runtime_ffmpeg import configure_pydub_once, resolve_ffmpeg_executable
+from .pcm_stream import PCMStreamAudioSource
 
 logger = logging.getLogger(__name__)
+
+# Buffer this much speech before unmuting, so the first frames do not play as
+# silence while the TTS response is still opening.
+_PREBUFFER_SECONDS = 0.20
+_PREBUFFER_BYTES = int(48000 * _PREBUFFER_SECONDS) * 2  # mono PCM16 at 48 kHz
 
 
 class VoicePlaybackManager:
@@ -33,6 +40,7 @@ class VoicePlaybackManager:
         self.is_speaking = False
         self._playback_done_event: Optional[asyncio.Event] = None
         self._playback_error: Optional[Exception] = None
+        self._active_stream: Optional[PCMStreamAudioSource] = None
         logger.info("VoicePlaybackManager initialized")
 
     def _finish_playback(self, error: Optional[Exception]) -> None:
@@ -85,8 +93,67 @@ class VoicePlaybackManager:
         audio_source = discord.FFmpegOpusAudio(str(audio_path), executable=ffmpeg)
         await self.play_audio(audio_source)
 
+    async def play_mono_pcm_stream(self, chunks: AsyncIterator[bytes]) -> float:
+        """Play 48 kHz mono PCM16 as it arrives; return the seconds actually played.
+
+        Playback starts once a short lead-in has buffered and continues while the
+        rest of the stream is still downloading, so time-to-first-word is bounded
+        by the TTS provider rather than by full synthesis.
+        """
+        if self.is_playing():
+            raise RuntimeError("Playback already in progress.")
+
+        source = PCMStreamAudioSource()
+        self._active_stream = source
+        play_task: Optional[asyncio.Task[None]] = None
+
+        def start_playback() -> None:
+            nonlocal play_task
+            if play_task is None:
+                play_task = asyncio.create_task(
+                    self.play_audio(source), name="tts-playback"
+                )
+
+        try:
+            pending = bytearray()
+            async for chunk in chunks:
+                if source.is_stopped:
+                    logger.debug("Playback was interrupted; dropping the rest of the stream.")
+                    break
+                if not chunk:
+                    continue
+
+                if play_task is not None:
+                    source.feed_mono(chunk)
+                    continue
+
+                pending.extend(chunk)
+                if len(pending) >= _PREBUFFER_BYTES:
+                    source.feed_mono(bytes(pending))
+                    pending.clear()
+                    start_playback()
+
+            # Reply shorter than the lead-in buffer: play whatever arrived.
+            if play_task is None and pending and not source.is_stopped:
+                source.feed_mono(bytes(pending))
+                start_playback()
+        finally:
+            # Closing the input first lets an already-running player drain and
+            # finish on its own instead of deadlocking on more bytes.
+            source.close_input()
+            if play_task is not None:
+                await play_task
+            if self._active_stream is source:
+                self._active_stream = None
+
+        return source.seconds_played
+
     async def stop_playback(self) -> None:
         """Stop current playback."""
+        stream, self._active_stream = self._active_stream, None
+        if stream is not None:
+            stream.stop()
+
         if not self.is_playing():
             return
 

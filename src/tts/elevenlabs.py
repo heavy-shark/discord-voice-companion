@@ -14,8 +14,17 @@ from ..storage.settings import SettingsStore
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL_ID = "eleven_multilingual_v2"
+# Flash v2.5 is the lowest-latency ElevenLabs model (~75 ms model inference) and
+# covers Ukrainian, Russian and English, so it is the right default for a bot
+# that has to answer inside a live conversation.
+_DEFAULT_MODEL_ID = "eleven_flash_v2_5"
 _ELEVEN_BASE_URL = "https://api.elevenlabs.io"
+
+# Discord plays 48 kHz stereo PCM16. Asking ElevenLabs for 48 kHz PCM directly
+# means the audio needs an interleave to stereo and nothing else — no MP3 decode,
+# no temp file, no FFmpeg process per reply.
+PCM_OUTPUT_FORMAT = "pcm_48000"
+PCM_SAMPLE_RATE_HZ = 48000
 
 
 def resolve_elevenlabs_api_key_from_env() -> Optional[str]:
@@ -114,7 +123,10 @@ class ElevenLabsTTSClient:
             "Content-Type": "application/json",
         }
         params = {"output_format": output_format}
-        payload = {"text": text, "model_id": self.model_id}
+        # No ``language_code``: the companion answers in whichever of Ukrainian,
+        # Russian or English the speaker used, and Flash v2.5 infers that from the
+        # text. Pinning a language here would fight the multilingual replies.
+        payload: dict[str, Any] = {"text": text, "model_id": self.model_id}
         timeout = httpx.Timeout(120.0, connect=30.0)
         logger.debug("Streaming TTS for persona '%s'", persona.display_name)
         async with httpx.AsyncClient(timeout=timeout, transport=self._http_transport) as client:
@@ -138,6 +150,11 @@ class ElevenLabsTTSClient:
     ) -> AsyncIterator[bytes]:
         """Stream synthesized audio as it is generated (same HTTP stream as ``synthesize_to_file``)."""
         async for chunk in self._iter_tts_audio_chunks(text, persona, output_format):
+            yield chunk
+
+    async def stream_pcm(self, text: str, persona: Persona) -> AsyncIterator[bytes]:
+        """Stream raw 48 kHz mono PCM16, ready to interleave and hand to Discord."""
+        async for chunk in self._iter_tts_audio_chunks(text, persona, PCM_OUTPUT_FORMAT):
             yield chunk
 
     async def synthesize_to_file(

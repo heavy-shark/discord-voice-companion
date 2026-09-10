@@ -15,14 +15,15 @@ from ..storage.transcripts import scrub_user_data_from_transcripts
 logger = logging.getLogger(__name__)
 
 DISCLOSURE_MESSAGE = """\
-**Discord Audio Bot — data processing disclosure**
+**Voice companion — data processing disclosure**
 
 By accepting, you **direct** this application to process your voice and related Discord data as follows:
 
-1. **Google Cloud Speech-to-Text** — Your voice audio is sent for real-time transcription.
-2. **Google GenAI (Gemini)** — Transcripts and conversation context may be sent to generate replies.
-3. **ElevenLabs** — Reply text may be sent to synthesize speech played back in the voice channel.
-4. **Local storage** — Transcript segments and session metadata may be saved as JSON files on the machine running the bot.
+1. **Google Gemini** — Your voice audio is sent to Google for transcription, and the resulting transcripts and conversation context are sent to generate replies.
+2. **ElevenLabs** — Reply text may be sent to synthesize speech played back in the voice channel.
+3. **Local storage** — Transcript segments and session metadata may be saved as JSON files on the machine running the bot.
+
+The bot keeps listening while it speaks, so audio you send while it is talking is processed the same way.
 
 You can **revoke** consent with `/consent revoke` and request removal of saved transcript segments with `/data delete` (see command description for confirmation).
 

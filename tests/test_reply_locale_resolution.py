@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
-from src.storage.reply_locale import resolve_bot_reply_language_code
+from src.storage import AUTO_REPLY_LOCALE
+from src.storage.reply_locale import is_auto_reply_locale, resolve_bot_reply_language_code
 
 
 class _FakeSettingsStore:
@@ -48,13 +49,22 @@ def test_resolve_env_when_stt_differs() -> None:
         assert resolve_bot_reply_language_code(store) == "de-DE"
 
 
-def test_resolve_no_env_uses_stt() -> None:
+def test_resolve_defaults_to_auto_so_replies_mirror_the_speaker() -> None:
+    """With nothing configured the companion answers in whatever it heard."""
     store = _FakeSettingsStore("nb-NO")
     removed: dict[str, str] = {}
     for key in ("BOT_REPLY_LANGUAGE", "BOT_LANGUAGE"):
         if key in os.environ:
             removed[key] = os.environ.pop(key)
     try:
-        assert resolve_bot_reply_language_code(store) == "nb-NO"
+        assert resolve_bot_reply_language_code(store) == AUTO_REPLY_LOCALE
+        assert is_auto_reply_locale(resolve_bot_reply_language_code(store))
     finally:
         os.environ.update(removed)
+
+
+def test_is_auto_reply_locale_recognizes_blank_and_auto() -> None:
+    assert is_auto_reply_locale(None)
+    assert is_auto_reply_locale("")
+    assert is_auto_reply_locale("  AUTO  ")
+    assert not is_auto_reply_locale("uk-UA")

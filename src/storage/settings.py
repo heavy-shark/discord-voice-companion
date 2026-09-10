@@ -28,8 +28,56 @@ def default_settings_template_path(settings_path: Optional[Path] = None) -> Path
     return base_path.with_name("settings-example.json")
 
 
-# Used when ``stt.language_code`` is missing or blank (BCP-47).
-DEFAULT_STT_LANGUAGE_CODE = "en-US"
+# Reply-language sentinel: mirror whichever language the speaker used instead of
+# pinning every reply to one locale.
+AUTO_REPLY_LOCALE = "auto"
+
+# Languages the companion is expected to hear and answer in.
+DEFAULT_STT_LANGUAGE_HINTS: tuple[str, ...] = ("uk-UA", "ru-RU", "en-US")
+
+# How eagerly the companion joins in, 0-100. Lives here rather than in
+# ``conversation.policy`` because storage is the lower layer: the policy imports
+# this, not the other way round.
+DEFAULT_TALKATIVENESS = 65
+
+DEFAULT_STT_BACKEND = "live"
+DEFAULT_STT_LIVE_MODEL = "gemini-3.5-transcribe-live"
+DEFAULT_STT_BATCH_MODEL = "gemini-2.5-flash"
+
+DEFAULT_STT_CONFIG: Dict[str, Any] = {
+    "backend": DEFAULT_STT_BACKEND,
+    "live_model": DEFAULT_STT_LIVE_MODEL,
+    "batch_model": DEFAULT_STT_BATCH_MODEL,
+    "language_hints": list(DEFAULT_STT_LANGUAGE_HINTS),
+    "emit_interim": True,
+}
+
+
+def _split_language_codes(raw: Any) -> List[str]:
+    """Parse "uk-UA, ru-RU, en-US" (or a list) into a clean list of BCP-47 codes."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        items: List[Any] = list(raw)
+    else:
+        items = str(raw).replace(";", ",").split(",")
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        code = _clean_optional_text(item)
+        if not code or code.casefold() in seen:
+            continue
+        seen.add(code.casefold())
+        out.append(code)
+    return out
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    """Read a boolean-ish environment variable."""
+    raw = _clean_optional_text(os.getenv(name, "")).lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
 
 
 def repair_utf8_mojibake(text: str) -> str:
@@ -199,128 +247,77 @@ class SettingsStore:
         return self.personas
 
     def get_stt_config(self) -> Dict[str, Any]:
-        """Get Speech-to-Text configuration."""
-        return self.settings.get(
-            "stt",
-            {
-                "language_code": DEFAULT_STT_LANGUAGE_CODE,
-                "alternative_language_codes": ["en-US", "en-GB"],
-                "speech_backend": "",
-                "google_application_credentials": "",
-                "project_id": "",
-                "location": "",
-                "model": "",
-            },
-        )
+        """The raw ``stt`` block, empty when unset.
 
-    def resolve_stt_api_key(self) -> str | None:
-        """STT API key from settings first, then environment."""
-        return self.resolve_api_secret("google_stt_api_key", "GOOGLE_STT_API_KEY")
+        Deliberately not pre-filled with :data:`DEFAULT_STT_CONFIG`: the
+        ``resolve_stt_*`` methods fall back to the environment before the
+        defaults, and baking values in here would shadow the environment.
+        """
+        return self.settings.get("stt", {})
 
-    def resolve_stt_project_id(self) -> str | None:
-        """STT v2 project id from settings first, then legacy API block, then environment."""
+    def resolve_stt_backend(self) -> str:
+        """``live`` (Gemini Live API, interim text) or ``batch`` (one request per utterance)."""
         stt = self.get_stt_config()
-        value = _clean_optional_text(stt.get("project_id"))
-        if value:
-            return value
-        return self.resolve_api_secret(
-            "google_stt_project_id",
-            "GOOGLE_STT_PROJECT_ID",
-            "GOOGLE_CLOUD_PROJECT",
-            "GCLOUD_PROJECT",
-        )
-
-    def resolve_stt_speech_backend(self) -> str | None:
-        """STT backend selector from settings first, then environment."""
-        stt = self.get_stt_config()
-        value = _clean_optional_text(stt.get("speech_backend"))
-        if value:
-            return value
-        return _clean_optional_text(os.getenv("GOOGLE_STT_SPEECH_BACKEND")) or None
-
-    def resolve_stt_credentials_path(self) -> str | None:
-        """Speech v2 service-account JSON path from settings first, then environment."""
-        stt = self.get_stt_config()
-        value = _clean_optional_text(stt.get("google_application_credentials"))
-        if value:
-            return value
-        return _clean_optional_text(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")) or None
-
-    def resolve_stt_location(self) -> str | None:
-        """Speech v2 location from settings first, then environment."""
-        stt = self.get_stt_config()
-        value = _clean_optional_text(stt.get("location"))
-        if value:
-            return value
-        return _clean_optional_text(os.getenv("GOOGLE_STT_LOCATION")) or None
-
-    def resolve_stt_model(self) -> str | None:
-        """Speech v2 model from settings first, then environment."""
-        stt = self.get_stt_config()
-        value = _clean_optional_text(stt.get("model"))
-        if value:
-            return value
-        return _clean_optional_text(os.getenv("GOOGLE_STT_MODEL")) or None
-
-    def set_stt_config(
-        self,
-        language_code: str,
-        alternative_language_codes: list[str],
-        *,
-        speech_backend: str | None = None,
-        google_application_credentials: str | None = None,
-        project_id: str | None = None,
-        location: str | None = None,
-        model: str | None = None,
-        update_backend_fields: bool = False,
-    ) -> None:
-        """Replace or merge the in-memory ``stt`` block (call ``save()`` to write ``settings.json``)."""
-        stt = dict(self.get_stt_config())
-        stt["language_code"] = language_code.strip() or DEFAULT_STT_LANGUAGE_CODE
-        stt["alternative_language_codes"] = alternative_language_codes
-        if update_backend_fields:
-            _set_clean_optional_text(stt, "speech_backend", speech_backend)
-            _set_clean_optional_text(
-                stt,
-                "google_application_credentials",
-                google_application_credentials,
+        value = _clean_optional_text(stt.get("backend"))
+        if not value:
+            value = _clean_optional_text(os.getenv("GEMINI_STT_BACKEND"))
+        normalized = (value or DEFAULT_STT_BACKEND).lower()
+        if normalized not in ("live", "batch"):
+            logger.warning(
+                "Unknown stt.backend %r; falling back to %r.", normalized, DEFAULT_STT_BACKEND
             )
-            _set_clean_optional_text(stt, "project_id", project_id)
-            _set_clean_optional_text(stt, "location", location)
-            _set_clean_optional_text(stt, "model", model)
-        self.settings["stt"] = stt
-        logger.debug("STT config updated in memory")
+            return DEFAULT_STT_BACKEND
+        return normalized
+
+    def resolve_stt_live_model(self) -> str:
+        """Model used by the ``live`` backend."""
+        stt = self.get_stt_config()
+        value = _clean_optional_text(stt.get("live_model"))
+        if value:
+            return value
+        return _clean_optional_text(os.getenv("GEMINI_STT_LIVE_MODEL")) or DEFAULT_STT_LIVE_MODEL
+
+    def resolve_stt_batch_model(self) -> str:
+        """Model used by the ``batch`` backend."""
+        stt = self.get_stt_config()
+        value = _clean_optional_text(stt.get("batch_model"))
+        if value:
+            return value
+        return _clean_optional_text(os.getenv("GEMINI_STT_BATCH_MODEL")) or DEFAULT_STT_BATCH_MODEL
+
+    def resolve_stt_language_hints(self) -> list[str]:
+        """BCP-47 codes that bias auto-detection; empty means pure auto-detect."""
+        stt = self.get_stt_config()
+        raw = stt.get("language_hints")
+        if raw is None:
+            raw = _split_language_codes(os.getenv("GEMINI_STT_LANGUAGE_HINTS", ""))
+            if not raw:
+                return list(DEFAULT_STT_LANGUAGE_HINTS)
+        if isinstance(raw, str):
+            raw = _split_language_codes(raw)
+        return [str(code).strip() for code in raw if str(code).strip()]
+
+    def resolve_stt_emit_interim(self) -> bool:
+        """Whether the live backend surfaces partial hypotheses (useful for the TUI)."""
+        stt = self.get_stt_config()
+        if "emit_interim" in stt:
+            return bool(stt.get("emit_interim"))
+        return _env_flag("GEMINI_STT_EMIT_INTERIM", default=True)
 
     def update_stt_config(self, **values: Any) -> None:
         """Update only selected STT keys while preserving the rest of the block."""
         stt = dict(self.get_stt_config())
         for key, value in values.items():
-            if key == "alternative_language_codes":
-                stt[key] = list(value)
-            elif key == "language_code":
-                stt[key] = _clean_optional_text(value) or DEFAULT_STT_LANGUAGE_CODE
+            if key == "language_hints":
+                stt[key] = (
+                    _split_language_codes(value) if isinstance(value, str) else list(value)
+                )
+            elif key == "emit_interim":
+                stt[key] = bool(value)
             else:
                 _set_clean_optional_text(stt, key, value)
         self.settings["stt"] = stt
         logger.debug("STT config partially updated in memory")
-
-    def apply_stt_api_secrets(
-        self,
-        *,
-        google_stt_api_key: str | None = None,
-        google_stt_project_id: str | None = None,
-    ) -> None:
-        """Merge STT secrets into ``api``; empty strings remove keys so ``.env`` applies again."""
-        api = dict(self.get_api_config())
-        updates = []
-        if google_stt_api_key is not None:
-            updates.append(("google_stt_api_key", google_stt_api_key))
-        if google_stt_project_id is not None:
-            updates.append(("google_stt_project_id", google_stt_project_id))
-        for key, raw in updates:
-            _set_clean_optional_text(api, key, raw)
-        self.settings["api"] = api
-        logger.debug("STT API secrets merged into api config")
 
     def get_runtime_config(self) -> Dict[str, Any]:
         """Get persisted runtime overrides that take precedence over ``.env``."""
@@ -329,19 +326,27 @@ class SettingsStore:
     def set_runtime_config(
         self,
         *,
-        reply_silence_seconds: float,
-        reply_cooldown_seconds: float,
         mention_window_seconds: float,
         reply_language: str,
+        talkativeness: int = DEFAULT_TALKATIVENESS,
+        reply_silence_seconds: float | str = "",
+        reply_cooldown_seconds: float | str = "",
         greet_on_join: bool = True,
+        barge_in: bool = True,
     ) -> None:
-        """Replace the in-memory runtime overrides block."""
+        """Replace the in-memory runtime overrides block.
+
+        ``reply_silence_seconds`` / ``reply_cooldown_seconds`` accept ``""`` to
+        mean "derive from ``talkativeness``" rather than pinning a timing.
+        """
         self.settings["runtime"] = {
+            "talkativeness": int(talkativeness),
             "reply_silence_seconds": reply_silence_seconds,
             "reply_cooldown_seconds": reply_cooldown_seconds,
             "mention_window_seconds": mention_window_seconds,
             "reply_language": reply_language.strip(),
             "greet_on_join": greet_on_join,
+            "barge_in": barge_in,
         }
         logger.debug("Runtime config updated in memory")
 
@@ -423,16 +428,16 @@ class SettingsStore:
         self,
         *,
         google_gemini_api_key: str,
-        google_stt_api_key: str,
-        google_stt_project_id: str,
         elevenlabs_api_key: str,
         discord_token: str | None = None,
     ) -> None:
-        """Replace the in-memory API/auth block."""
+        """Replace the in-memory API/auth block.
+
+        Transcription, conversation and the volunteer gate all run on the single
+        Gemini key, so there is no separate speech-to-text credential.
+        """
         self.settings["api"] = {
             "google_gemini_api_key": google_gemini_api_key.strip(),
-            "google_stt_api_key": google_stt_api_key.strip(),
-            "google_stt_project_id": google_stt_project_id.strip(),
             "elevenlabs_api_key": elevenlabs_api_key.strip(),
         }
         if discord_token is not None:
@@ -523,7 +528,9 @@ class SettingsStore:
             "elevenlabs_usd_per_1k_characters": 0.1,
             "genai_usd_per_1m_input_tokens": 0.25,
             "genai_usd_per_1m_output_tokens": 1.5,
-            "google_stt_usd_per_minute": 0.016,
+            # Gemini bills audio as tokens (32/second), which works out far below
+            # the old Google Cloud Speech per-minute rate this used to default to.
+            "google_stt_usd_per_minute": 0.001,
         }
         stored = self.settings.get("pricing")
         if not isinstance(stored, dict):
@@ -568,9 +575,11 @@ class SettingsStore:
         raw: Dict[str, Any] = raw_block if isinstance(raw_block, dict) else {}
         specs: list[tuple[str, str, float]] = [
             ("elevenlabs_usd_per_1k_characters", "ELEVENLABS_USD_PER_1K_CHARACTERS", 0.1),
-            ("genai_usd_per_1m_input_tokens", "GENAI_USD_PER_1m_INPUT_TOKENS", 0.25),
-            ("genai_usd_per_1m_output_tokens", "GENAI_USD_PER_1m_OUTPUT_TOKENS", 1.5),
-            ("google_stt_usd_per_minute", "GOOGLE_STT_USD_PER_MINUTE", 0.016),
+            # Env names are upper-case: os.environ is case-insensitive on Windows
+            # but not on Linux, where the lower-case "1m" spelling silently missed.
+            ("genai_usd_per_1m_input_tokens", "GENAI_USD_PER_1M_INPUT_TOKENS", 0.25),
+            ("genai_usd_per_1m_output_tokens", "GENAI_USD_PER_1M_OUTPUT_TOKENS", 1.5),
+            ("google_stt_usd_per_minute", "GOOGLE_STT_USD_PER_MINUTE", 0.001),
         ]
         resolved: Dict[str, float] = {}
         for key, env_name, default in specs:

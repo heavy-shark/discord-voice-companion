@@ -23,6 +23,12 @@ from src.discord.playback import VoicePlaybackManager
 from src.discord.preflight import PreflightError, validate_voice_runtime
 from src.discord.voice_sink import DiscordAudioSink
 from src.models import TranscriptSegment
+from src.storage.settings import (
+    DEFAULT_STT_BATCH_MODEL,
+    DEFAULT_STT_CONFIG,
+    DEFAULT_STT_LANGUAGE_HINTS,
+    DEFAULT_STT_LIVE_MODEL,
+)
 
 
 def run_async(awaitable):
@@ -794,10 +800,7 @@ class FakeSettingsStore:
     """Minimal settings stub for transcription tests."""
 
     def get_stt_config(self) -> dict[str, object]:
-        return {
-            "language_code": "da-DK",
-            "alternative_language_codes": ["en-US"],
-        }
+        return dict(DEFAULT_STT_CONFIG)
 
     def resolve_discord_secret(self, _key: str, *env_names: str) -> str | None:
         for name in env_names:
@@ -806,31 +809,30 @@ class FakeSettingsStore:
                 return value
         return None
 
-    def resolve_stt_api_key(self) -> str | None:
-        return None
+    def resolve_api_secret(self, _key: str, *_env_names: str) -> str | None:
+        return "fake-gemini-key"
 
-    def resolve_stt_project_id(self) -> str | None:
-        return None
+    def resolve_stt_backend(self) -> str:
+        return "batch"
 
-    def resolve_stt_speech_backend(self) -> str | None:
-        return None
+    def resolve_stt_live_model(self) -> str:
+        return DEFAULT_STT_LIVE_MODEL
 
-    def resolve_stt_credentials_path(self) -> str | None:
-        return None
+    def resolve_stt_batch_model(self) -> str:
+        return DEFAULT_STT_BATCH_MODEL
 
-    def resolve_stt_location(self) -> str | None:
-        return None
+    def resolve_stt_language_hints(self) -> list[str]:
+        return list(DEFAULT_STT_LANGUAGE_HINTS)
 
-    def resolve_stt_model(self) -> str | None:
-        return None
+    def resolve_stt_emit_interim(self) -> bool:
+        return False
 
 
 class FakeStreamingSTTClient:
     """Fake STT client that yields one final transcript per utterance."""
 
-    def __init__(self, primary_language: str, alternative_languages: list[str], **_kwargs) -> None:
-        self.primary_language = primary_language
-        self.alternative_languages = alternative_languages
+    def __init__(self, _api_key: str = "", *, language_hints=None, **_kwargs) -> None:
+        self.language_hints = list(language_hints or DEFAULT_STT_LANGUAGE_HINTS)
 
     async def validate_connectivity(self) -> None:
         return None
@@ -855,7 +857,7 @@ class FakeStreamingSTTClient:
                 start_ts=utterance_started_at or 0.0,
                 end_ts=(utterance_started_at or 0.0) + 0.25,
                 is_final=True,
-                language_code=self.primary_language,
+                language_code=self.language_hints[0],
             )
 
 
@@ -868,7 +870,7 @@ def test_run_transcribe_flow_logs_and_persists_segments(monkeypatch, tmp_path) -
         monkeypatch.setattr(main_module, "configure_logging", lambda: None)
         monkeypatch.setattr(main_module, "DiscordClient", FakeTranscriptionDiscordClient)
         monkeypatch.setattr(main_module, "SettingsStore", FakeSettingsStore)
-        monkeypatch.setattr(main_module, "GoogleSTTClient", FakeStreamingSTTClient)
+        monkeypatch.setattr(main_module, "GeminiSTTClient", FakeStreamingSTTClient)
         monkeypatch.setattr(main_module, "validate_voice_dependencies", lambda: None)
 
         class TmpTranscriptWriter(main_module.TranscriptSessionWriter):

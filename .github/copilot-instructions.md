@@ -9,8 +9,8 @@ description: "Guidelines for developing the Discord Audio Bot using GitHub Copil
 You are assisting with a **Discord voice-channel conversational bot** (Python 3.11+). It:
 
 - Joins voice channels and receives audio (`discord.py`, `discord-ext-voice-recv`, DAVE/`davey`)
-- Streams per-user audio to **Google Cloud Speech-to-Text**
-- Runs reply logic and **Google GenAI (Gemini)** multi-turn chat
+- Transcribes per-user audio with **Gemini** (Live API streaming, or one request per utterance)
+- Runs reply logic and **Google GenAI (Gemini)** multi-turn chat, on the same API key
 - Synthesizes replies with **ElevenLabs** and plays them back into the channel
 - Is controlled from a **Textual** terminal UI (dashboard + settings editor), with **slash commands** for privacy compliance (`/consent`, `/data`)
 
@@ -22,8 +22,8 @@ Use these real paths (not legacy single-file names):
 |------|-----------|
 | CLI entry | `src/main.py` |
 | Voice session orchestration | `src/session/conversation_runner.py`, `src/session/metrics.py` |
-| Discord gateway / voice | `src/discord/client.py`, `playback.py`, `voice_sink.py`, `voice_recv_patch.py`, `preflight.py` |
-| STT pipeline | `src/transcription/coordinator.py`, `stt.py`, `stt_v1.py`, `preprocessing.py`, `vad.py` |
+| Discord gateway / voice | `src/discord/client.py`, `playback.py`, `pcm_stream.py`, `voice_sink.py`, `voice_recv_patch.py`, `preflight.py` |
+| STT pipeline | `src/transcription/coordinator.py`, `gemini_stt.py`, `preprocessing.py` |
 | Conversation | `src/conversation/chat.py`, `policy.py`, `log.py`, `persona.py` |
 | Data models | `src/models/audio.py`, `config.py`, `transcript.py` |
 | Persistence / resolution | `src/storage/settings.py`, `transcripts.py`, `consent.py`, `reply_locale.py` |
@@ -68,10 +68,10 @@ Prefer dataclasses and explicit types for frames and transcript segments (see `s
 
 ## Library notes (high level)
 
-- **discord.py + voice_recv**: pause inbound transcription while the bot plays TTS; resume after playback completes.
-- **Speech-to-Text**: supports v1 (API key) and v2 (service account + project/location/model); configuration flows through `SettingsStore`.
+- **discord.py + voice_recv**: voice receive stays on for the whole session, including while the bot thinks and speaks. Do not reintroduce stop/start-listening around replies — continuous receive is what makes barge-in and follow-up context work.
+- **Speech-to-Text**: Gemini, `live` (Live API WebSocket, 16 kHz mono PCM) or `batch` (one `generate_content` per utterance); configuration flows through `SettingsStore`.
 - **Google GenAI**: use the `google-genai` patterns already in `src/conversation/chat.py` (not the older `google-generativeai` package name in examples elsewhere on the web).
-- **ElevenLabs**: streaming HTTP; voice id per persona in `settings.json`.
+- **ElevenLabs**: plain REST/streaming via `httpx` — the official SDK is deliberately not a dependency (its filenames break `pip install` on Windows without long-path support). Replies stream as 48 kHz PCM straight into `PCMStreamAudioSource`; voice id per persona in `settings.json`.
 - **Textual**: reactive state and workers for long tasks; keep UI updates on the Textual loop.
 
 ## Discord interaction style

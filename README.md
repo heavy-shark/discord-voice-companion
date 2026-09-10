@@ -1,287 +1,281 @@
-# Discord Audio Bot
+# Discord Voice Companion
 
-<img width="1068" height="299" alt="image" src="https://github.com/user-attachments/assets/c684ef20-9767-476b-a742-b38ad745823c" />
+A Discord bot that sits in a voice channel and takes part in the conversation: it
+listens continuously, transcribes each speaker with **Gemini**, decides whether it
+has something worth saying, and answers out loud through **ElevenLabs** — in
+Ukrainian, Russian or English, matching whoever just spoke.
 
----
-
-<img width="1069" height="643" alt="image" src="https://github.com/user-attachments/assets/8ae49b3c-69aa-4ada-b594-f3361e9a0327" />
-
-
-A Discord voice-channel conversational bot with a [Textual TUI](https://textual.textualize.io/). The bot joins voice channels, listens to speakers, transcribes speech in real time, maintains multi-turn conversations using [Google GenAI](https://github.com/googleapis/python-genai), and replies with synthesized speech via [ElevenLabs](https://github.com/elevenlabs/elevenlabs-python).
-
----
-
-## Features
-
-- **Voice integration**: Joins Discord voice channels via [discord.py](https://github.com/Rapptz/discord.py) and [discord-ext-voice-recv](https://github.com/imayhaveborkedit/discord-ext-voice-recv) with DAVE encryption support
-- **Real-time transcription**: Per-user speech-to-text via [Google Cloud Speech-to-Text](https://github.com/googleapis/python-speech)
-- **Conversational AI**: Multi-turn chat with [Google GenAI](https://github.com/googleapis/python-genai) and conversation context
-- **Text-to-speech**: [ElevenLabs](https://github.com/elevenlabs/elevenlabs-python) streaming TTS
-- **Smart reply triggers**:
-  - Default: reply after a silence window (configurable), with a cooldown between replies
-  - Mention mode: wait for silence after the bot name is mentioned, within a configurable window
-  - Join greeting: optional spoken greeting when the bot joins or others enter mid-session
-- **[Textual](https://textual.textualize.io/)**: Session control from the terminal; **privacy**: users must run `/consent accept` on discord before their voice is transcribed or sent to third-party APIs (see slash commands `/consent`, `/data`)
-- **Characters**: System instructions, Gemini model, and ElevenLabs voice per character
-- **Session logging**: JSON transcripts and usage counters per session
+Forked from [Magnus5405/discord-audio-bot](https://github.com/Magnus5405/discord-audio-bot)
+(MIT), which supplied the DAVE-capable voice receive path and the Textual control UI.
 
 ---
 
-## Installation
+## Pipeline
 
-### Windows
+```text
+Discord voice receive (per-user Opus, DAVE-decrypted)
+  → per-speaker utterance chunking (48 kHz stereo → 16 kHz mono PCM)
+  → Gemini transcription (streaming Live API, or one request per utterance)
+  → conversation log + reply policy
+  → Gemini chat (persona + context)          [+ a cheap "worth saying?" gate]
+  → ElevenLabs Flash v2.5 → 48 kHz PCM → straight into the voice channel
+```
 
-Tagged releases publish **Windows** artifacts on [GitHub Releases](https://github.com/Magnus5405/discord-audio-bot/releases):
-
-| Asset | What it is |
-|-------|------------|
-| **`DiscordAudioBotTUI-Setup.exe`** | Inno Setup installer — installs under Program Files, adds a Start Menu entry, and optionally a desktop shortcut. |
-| **`DiscordAudioBotTUI-windows.zip`** | Portable folder — extract anywhere and run `DiscordAudioBotTUI.exe`. |
-
-Both bundles include **FFmpeg** next to the executable — no separate FFmpeg install. The build ships a read-only `settings-example.json` beside the app; the real `settings.json` is created only when you save from the **Settings** TUI editor, so upgrades in the same folder preserve your existing config.
-
-### MacOS / Linux
-No official releases for macOS and Linux, but contributions are welcome to implement this.
-
-Install and run **from source**; follow [Development](#development).
-
-
-### API credentials
-
-You need accounts for **Discord**, **Google** (Gemini + Speech-to-Text), and **ElevenLabs**:
-
-- **Discord**: [Developer Portal](https://discord.com/developers/applications) $\rightarrow$ `DISCORD_TOKEN`.
-- **Gemini**: API key from [Google AI Studio](https://aistudio.google.com/) $\rightarrow$ `GOOGLE_GEMINI_API_KEY`.
-- **Speech-to-Text**: [Google Cloud](https://console.cloud.google.com/) credentials for Speech-to-Text API enabled $\rightarrow$ `GOOGLE_STT_API_KEY` for v1, or service account + project fields for v2.
-- **ElevenLabs**: [API keys](https://elevenlabs.io/app/settings/api-keys) $\rightarrow$ `ELEVENLABS_API_KEY`.
-
-Visit the [Wiki](https://github.com/magnus5405/discord-audio-bot/wiki) for a more detailed description on how to aquire these credentials.
-
-### Running
-
-Launch **`DiscordAudioBotTUI.exe`**, enter required credentials and configure your character in the settings. After configuring credentials, simply choose a **server**, **voice channel**, and **persona**, then press **Start** to connect.
-
-For dashboard behavior, logging paths, and the settings editor, see [Textual dashboard](#textual-dashboard) under Development.
+Everything except speech synthesis runs on a single Gemini API key.
 
 ---
 
-## Unimplemented Features
+## What makes it feel like a companion
 
-These are features that are planned or would be valuable additions to the project in the future.
+**It never goes deaf.** Voice receive stays on while the bot is thinking and while
+it is talking, so it hears follow-ups and interruptions instead of missing the
+half of the conversation that happens during its own turn.
 
-- **SDK-agnostic interface for AI conversation**  
-The current implementation is designed around a specific provider workflow. A provider-agnostic abstraction layer would make it possible to support multiple AI backends through a shared interface. This would allow the project to integrate with providers such as OpenAI, Anthropic or self-hosted local models without changing the surrounding bot logic. See [#13](https://github.com/magnus5405/discord-audio-bot/issues/13)
+**It can be interrupted.** The moment a human starts speaking over it, playback
+stops mid-sentence (`BOT_BARGE_IN`, on by default).
 
-- **Local Speech-to-Text**  
-The project currently depends on external speech recognition services. Adding support for local Speech-to-Text would make it possible to run the full voice pipeline on the user’s own machine or server. This would reduce API costs and lower latency in some environments. It would also open the door to supporting popular local transcription engines such as [Whisper](https://github.com/openai/whisper)-based solutions or other on-device speech recognition systems. See [#14](https://github.com/magnus5405/discord-audio-bot/issues/14)
+**It decides whether to speak, not just when.** One `talkativeness` dial (0-100)
+sets how often the bot *considers* joining in; a separate one-token Gemini call
+then decides whether this particular moment is worth it. That check runs outside
+the chat session, so declined interjections leave no trace in the conversation
+history. At `0` the bot is purely reactive and only answers when addressed by name.
 
-- **Local Text-to-Speech**  
-At the moment, voice synthesis depends on an external provider. This was chosen because ElevenLabs offer fair pricing and great voice models, with support for custom voices. Supporting local Text-to-Speech would allow fully self-hosted voice output, which would be useful for privacy-sensitive setups, offline environments, and users who want to avoid external API costs. It would also make the project more flexible for experimentation with custom voices and open-source speech models. See [#15](https://github.com/magnus5405/discord-audio-bot/issues/15)
+**It follows the language of the room.** Transcription auto-detects, and replies
+mirror the speaker turn by turn — a Ukrainian question gets a Ukrainian answer.
+Set `BOT_REPLY_LANGUAGE` to a BCP-47 tag to pin one language instead.
+
+**It starts speaking before it has finished synthesizing.** ElevenLabs streams
+48 kHz PCM directly into a Discord audio source: no MP3 decode, no temp file, no
+FFmpeg process per reply.
+
+---
+
+## Setup — three keys, then run
+
+You need a **Discord bot account** (a user account / "selfbot" is a ToS violation
+and, since DAVE, not workable anyway), and two API keys.
+
+| # | Variable | Where to get it |
+|---|---|---|
+| 1 | `DISCORD_TOKEN` | [Developer Portal](https://discord.com/developers/applications) → your app → **Bot** → Reset Token |
+| 2 | `GOOGLE_GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) → Get API key |
+| 3 | `ELEVENLABS_API_KEY` | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
+
+Put all three in **`.env`** (already in the repo, with the fields empty and
+commented). Nothing else is required.
+
+> ⚠️ `.env` is committed on purpose so a deployment that clones the repo picks up
+> the config. **Keep the repository private.** If it is ever public, rotate all
+> three keys.
+
+**Inviting the bot.** In the Developer Portal → OAuth2 → URL Generator, tick
+scopes **`bot`** and **`applications.commands`**, and bot permissions **Connect**
+and **Speak**. Open the generated URL and add it to your server.
+
+Set `DISCORD_SERVER_ID` in `.env` too — without it, slash commands register
+globally and can take up to an hour to show up.
+
+### Then, in Discord
+
+1. Join a voice channel.
+2. Type **`/join`**.
+
+That is the whole flow. `/leave` disconnects, `/status` says what it is doing.
+To skip the command entirely, set `DISCORD_VOICE_CHANNEL_ID` in `.env` and it
+joins that channel on startup.
+
+---
+
+## Running it
+
+### On a server / process manager
+
+Point it at the repo and run:
+
+```
+python main.py
+```
+
+- **Working directory**: the repo root (where `main.py` and `.env` are).
+- **Install step**: `pip install -r requirements.txt`.
+- No arguments, no terminal interaction. It stays online and idles until `/join`.
+- Handles SIGTERM cleanly, so restarts are safe.
+
+### Locally, with a terminal
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows;  source .venv/bin/activate elsewhere
+pip install -r requirements.txt
+
+python main.py                       # same headless mode
+python -m src.main --tui             # dashboard with live metrics
+python -m src.main --list-voice-channels
+```
+
+### Notes
+
+- **Python 3.11+.**
+- **FFmpeg is not needed** for the normal reply path — only for the
+  `--audio-path` playback smoke test.
+- Installing needs no Windows long-path support: the ElevenLabs Python SDK is
+  deliberately not a dependency (it ships filenames long enough to break
+  `pip install` on default Windows setups), and there is nothing to compile from
+  source.
+
+---
+
+## Configuration
+
+All of it lives in `.env`, and anything saved from the settings editor in
+`settings.json` takes precedence.
+
+### Transcription
+
+| Key | Default | Meaning |
+|---|---|---|
+| `GEMINI_STT_BACKEND` | `live` | `live` streams into the Gemini Live API (lowest latency, emits partial text); `batch` sends one request per utterance |
+| `GEMINI_STT_LIVE_MODEL` | `gemini-3.5-transcribe-live` | Model for the `live` backend |
+| `GEMINI_STT_BATCH_MODEL` | `gemini-2.5-flash` | Model for the `batch` backend |
+| `GEMINI_STT_LANGUAGE_HINTS` | `uk-UA,ru-RU,en-US` | Biases auto-detection; blank means unbiased |
+| `STT_IDLE_TIMEOUT_SECONDS` | `1.2` | Silence gap that ends one speaker's utterance |
+
+`gemini-3.5-transcribe-live` was in public preview at the time of writing. If your
+key does not have it, startup fails with the list of models it *does* have — set
+`GEMINI_STT_LIVE_MODEL` to one of those, or switch to the `batch` backend.
+
+### Behaviour
+
+| Key | Default | Meaning |
+|---|---|---|
+| `BOT_TALKATIVENESS` | `65` | 0-100. `0` = only answers when addressed |
+| `BOT_REPLY_SILENCE_SECONDS` | derived | Override the silence gap before replying |
+| `BOT_REPLY_COOLDOWN_SECONDS` | derived | Override the minimum gap between replies |
+| `BOT_MENTION_WINDOW_SECONDS` | `30` | Max wait after being named before answering anyway |
+| `BOT_BARGE_IN` | `true` | Stop talking when a human speaks over the bot |
+| `BOT_REPLY_LANGUAGE` | *(auto)* | Pin replies to one BCP-47 tag |
+| `BOT_GREET_ON_JOIN` | `true` | Greet on join and when someone enters mid-session |
+| `BOT_REQUIRE_CONSENT` | `false` | Require `/consent accept` per speaker before transcribing |
+
+The two timing overrides are blank by default and derived from `talkativeness`
+instead. The mapping is geometric rather than linear, because the midpoint between
+a 180 s and an 8 s cooldown is not "moderately chatty" at 94 s:
+
+| Talkativeness | Silence before replying | Cooldown |
+|---|---|---|
+| 0 | 6.0 s | never volunteers |
+| 50 | 3.1 s | 38 s |
+| 65 (default) | 2.5 s | 24 s |
+| 100 | 1.6 s | 8 s |
+
+### Persona
+
+Characters live in `settings.json` (or the **Characters** tab of the settings
+editor): system instruction, Gemini model, ElevenLabs voice id, and
+`alternative_names` — the aliases that count as addressing the bot when they show
+up in a transcript. Set those to how people will actually say the name out loud.
+
+---
+
+## Privacy
+
+When the bot joins, it posts a notice in the channel saying that voice is
+transcribed by Gemini and answered via ElevenLabs.
+
+Per-speaker consent is **opt-in** (`BOT_REQUIRE_CONSENT`, default off) — with it
+on, a speaker's audio is ignored until they run `/consent accept`, which is
+correct for a server where you need recorded proof of disclosure but reads as "the
+bot is broken" on a private server. `/consent revoke` and `/data delete` work
+either way. The disclosure text is in `src/discord/consent_commands.py`; keep it
+accurate if you change which services the pipeline touches.
+
+Conversation state is not persisted across runs. Session transcripts are written
+to `transcripts/` for debugging.
+
+---
+
+## Costs
+
+Roughly, per hour of *active conversation*:
+
+- **Transcription** — Gemini bills audio at 32 tokens/second, so on a Flash-tier
+  model this is cents per hour, not dollars.
+- **Chat + volunteer gate** — small; the gate is one token of output per check.
+- **Speech** — ElevenLabs bills per character, and this is the dominant cost.
+
+Live estimates appear in the TUI; the rate card is under `pricing` in
+`settings.json` / the `*_USD_*` variables in `.env`.
 
 ---
 
 ## Development
 
-### Prerequisites
-
-- **[Python 3.11+](https://www.python.org/downloads/)**
-- **[FFmpeg]()**: required for audio encode/decode when **running from source** (install on `PATH`). **Official Windows TUI builds** (installer and portable zip) ship **ffmpeg.exe** and **ffprobe.exe** next to the executable — no separate FFmpeg install for those.
-  - macOS: `brew install ffmpeg`
-  - Ubuntu/Debian: `sudo apt-get install ffmpeg`
-  - Windows: [gyan.dev/ffmpeg](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip) or `choco install ffmpeg`
-
-### Setup
-
-#### Clone and install
-
 ```bash
-git clone https://github.com/Magnus5405/discord-audio-bot.git
-cd discord-audio-bot
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
-```
-
-#### Configuration: `.env` and `settings.json`
-There are two layers:
-
-1. **`.env`** — secrets and machine-local defaults (loaded via `python-dotenv` on startup).
-   `.env.example` documents defaults for reply timing, STT backend, optional pricing hints, `DEBUG_MODE`, and `TUI_LOG_FILE`.
-2. **`settings.json`** in the project root — personas, STT language, UI selections, and optional persisted API keys or Discord fields when you save from the TUI settings editor.
-   When `settings.json` is missing, the app falls back to `settings-example.json` if present and creates `settings.json` on the first save.
-
-**Precedence**:
-
-- API secrets such as Gemini, STT, ElevenLabs, and Discord token are resolved with **values saved in `settings.json` first**, then fall back to environment variables
-
-You can edit `settings.json` or generate it entirely from **Settings** inside the dashboard TUI (`python -m src.main --tui`). Released Windows bundles keep `settings-example.json` as reference-only and preserve an existing `settings.json` during updates.
-
-**Encrypting secrets in `settings.json`:** Set **`SETTINGS_SECRET_KEY`** in `.env` with a Fernet key (44-character url-safe base64) to store API keys under `settings.api` or the Discord token under `settings.discord`. plaintext values are rejected on load.
-
-**FFmpeg:** TTS playback uses FFmpeg. **Released Windows TUI builds** include FFmpeg next to `DiscordAudioBotTUI.exe`. When **developing from a clone**, install FFmpeg on `PATH` or set **`FFMPEG_PATH`** to the `ffmpeg` / `ffmpeg.exe` binary for a custom location.
-
-**Slash commands (`/consent`, `/data`):** These are **application commands**, not normal chat messages. In Discord, type **`/`** and select this bot’s command from the menu (or tap the command suggestion). Typing `/consent accept` as plain text does nothing. The bot invite must include the **`applications.commands`** OAuth2 scope. For fastest registration in your server, set **`server_id`** in Settings (or **`DISCORD_SERVER_ID`** in `.env`) to your Discord server (guild) id, or run the bot in **only one** server so it can auto-register commands there. Otherwise global registration can take up to about an hour to appear everywhere. After connecting the TUI, check the **Activity log** for a line confirming slash command registration.
-
-### Running
-
-#### Headless smoke and pipeline checks
-
-```bash
-python -m src.main --list-voice-channels
-python -m src.main --channel-id 123456789012345678 --audio-path /path/to/local-test-clip.mp3
-python -m src.main --channel-id 123456789012345678 --audio-path /path/to/local-test-clip.mp3 --receive-smoke
-python -m src.main --channel-id 123456789012345678 --transcribe
-python -m src.main --channel-id 123456789012345678 --transcribe --listen-window-seconds 30
-python -m src.main --channel-id 123456789012345678 --converse --listen-window-seconds 60
-python -m src.main --tui
-```
-
-What these modes do:
-
-1. Load `.env` and merge with `settings.json` where applicable.
-2. Connect and print guild/voice channel IDs (`--list-voice-channels`).
-3. Join a channel and play a local MP3/WAV once.
-4. **Receive smoke** (`--receive-smoke`): listen, play the clip, listen again with a fresh sink; logs receive summaries.
-5. **Transcription** (`--transcribe`): PCM receive, per-user STT, session JSON under `transcripts/`.
-6. **Conversation** (`--converse`): same STT path as transcription, plus GenAI replies and ElevenLabs playback (requires keys and personas); usage fields updated in the session JSON.
-7. Disconnect when the selected mode finishes (or on Ctrl+C).
-
-If you set `DISCORD_VOICE_CHANNEL_ID` and `BOT_TEST_AUDIO_PATH`, you can run `python -m src.main` without repeating `--channel-id` / `--audio-path`.
-
-#### Textual dashboard
-
-```bash
-python -m src.main --tui
-```
-
-Same credential expectations as full conversation mode. Do **not** combine `--tui` with `--converse`, `--transcribe`, `--channel-id`, or other headless flags.
-
-- Pick a **server**, **voice channel**, and **persona**, then **Start**.
-- Metrics refresh periodically (session time, STT audio minutes, GenAI tokens, TTS minutes).
-- **Stop** ends the voice session cleanly; the bot stays logged in for another run.
-- **Settings** (default binding: comma) opens the tabbed editor (personas, STT, Discord, API keys, cooldowns, pricing display).
-- Logs go to **`logs/tui.log`** by default so the terminal stays clean; override with `TUI_LOG_FILE`.
-
-#### Standalone settings editor
-
-```bash
-python -m src.ui.settings
-```
-
-Edits and saves `settings.json` without starting Discord.
-
-### Format, lint, typecheck
-
-```bash
-ruff check src/ tests/
-mypy src/ --ignore-missing-imports --strict
-```
-
-### Tests
-
-```bash
+ruff check src tests
+mypy src --ignore-missing-imports --strict
 pytest
-pytest -v
-pytest tests/test_models.py
-pytest --cov=src --cov-report=html
 ```
 
----
-
-## Release branch (`latest`)
-
-**Windows releases:** GitHub Actions produces **`DiscordAudioBotTUI-Setup.exe`** (Inno Setup) and a portable **`DiscordAudioBotTUI-windows.zip`**.
-
-The repo ships **`settings-example.json`** as a neutral template beside the executable. Windows release builds no longer pre-create `settings.json`, and same-directory upgrades preserve any existing `settings.json`.
-
-Production Windows releases are driven off the **`latest`** branch:
-
-1. Open a pull request **into `latest`**. CI runs **lint / typecheck / tests** (same as other PRs) plus a **version check**: `pyproject.toml` `[project] version` and `src/__init__.py` `__version__` must **match** each other, and the version must be **strictly greater** than on the current `latest` tip (semver).
-2. After merge, the [**Release**](.github/workflows/cd.yml) workflow runs on **`latest`**: it builds the Windows artifacts and creates a **GitHub Release** (and git tag **`v{version}`** from `[project] version`) via the release API. Pushes of `GITHUB_TOKEN` do not chain-trigger other workflows, so this path avoids a separate tag-push job.
-
----
-
-## Architecture
-
-End-to-end data flow:
-
-```text
-Discord voice receive $\rightarrow$ preprocessing / optional VAD $\rightarrow$ Google STT
-  $\rightarrow$ conversation log + reply policy $\rightarrow$ Google GenAI $\rightarrow$ ElevenLabs TTS $\rightarrow$ Discord playback
-```
-
-`settings.json` and `.env` feed STT backend choice, languages, personas, API keys, and reply timing.
-
-### `src/` package map
+### Package map
 
 ```
+main.py                          # Server entry point: python main.py
 src/
-├── main.py                 # CLI: headless modes and --tui dispatch
+├── main.py                      # CLI: headless modes and --tui dispatch
 ├── session/
-│   ├── conversation_runner.py   # Voice session: STT, policy, GenAI, TTS, playback
-│   └── metrics.py               # Live counters for the TUI
+│   ├── conversation_runner.py   # The voice session: policy, chat, TTS, playback
+│   └── service.py               # Start/stop/supervise sessions for a long-lived process
 ├── conversation/
-│   ├── chat.py             # GenAI chat manager
-│   ├── log.py              # Transcript merge / conversation log
-│   ├── persona.py          # Persona selection
-│   └── policy.py           # Reply trigger state machine
+│   ├── chat.py                  # Gemini chat, language rules, volunteer gate
+│   ├── policy.py                # Talkativeness dial and reply triggers
+│   ├── log.py                   # Transcript merge / "since last bot turn"
+│   └── persona.py
 ├── discord/
-│   ├── client.py           # Gateway, voice join, receive lifecycle
-│   ├── playback.py         # VoiceClient playback
-│   ├── voice_sink.py       # Incoming audio sink $\rightarrow$ queues
-│   ├── voice_recv_patch.py # Compatibility patches
-│   └── preflight.py        # FFmpeg / voice dependency checks
-├── models/
-│   ├── audio.py            # AudioFrame
-│   ├── config.py           # Persona, usage counters
-│   └── transcript.py     # TranscriptSegment, ConversationTurn
-├── storage/
-│   ├── settings.py         # settings.json load/save and resolution helpers
-│   ├── transcripts.py    # Session JSON writer
-│   └── reply_locale.py     # Reply BCP-47 resolution
+│   ├── client.py                # Gateway, voice join, receive lifecycle
+│   ├── voice_sink.py            # Incoming audio → queue
+│   ├── pcm_stream.py            # Streaming PCM audio source (+ barge-in)
+│   ├── playback.py              # Playback lifecycle
+│   └── consent_commands.py      # /consent, /data
 ├── transcription/
-│   ├── coordinator.py      # Per-user STT orchestration
-│   ├── preprocessing.py    # PCM helpers
-│   ├── stt.py              # STT client factory / streaming API
-│   ├── stt_v1.py           # Speech-to-Text v1 client
-│   └── vad.py              # Optional WebRTC VAD
-├── tts/
-│   └── elevenlabs.py       # ElevenLabs HTTP client
-└── ui/
-    ├── main.py             # TUI entry re-exports / `BotUI` alias
-    ├── dashboard/          # Main Textual dashboard (app, layout, formatting)
-    ├── settings/           # Settings editor (screen, pages, layout)
-    └── widgets/            # Dashboard widgets
+│   ├── gemini_stt.py            # Gemini live + batch transcription
+│   ├── coordinator.py           # Per-user utterance chunking
+│   └── preprocessing.py         # 48 kHz stereo → 16 kHz mono
+├── tts/elevenlabs.py            # REST/streaming client (no SDK)
+├── storage/                     # settings.json, consent, transcripts
+└── ui/                          # Textual dashboard and settings editor
 ```
 
-**Concurrency**: Discord runs on asyncio; voice sink callbacks may run off the main async path—forward work to `asyncio.Queue` with `loop.call_soon_threadsafe` instead of blocking. The Textual app has its own loop; the dashboard communicates with the Discord side via the session runner and shared settings/metrics—do not call Discord APIs from sink callbacks.
+### Concurrency notes
+
+Discord runs on asyncio, but voice sink callbacks and the audio player run on
+their own threads. Forward work to an `asyncio.Queue` via
+`loop.call_soon_threadsafe` rather than blocking, and never call Discord APIs
+from a sink callback.
+
+### Known trade-off
+
+The `live` backend opens one Live API WebSocket per utterance, because utterance
+segmentation happens on the Discord side. In a fast back-and-forth that is a
+connection per turn. A persistent per-speaker session would avoid it; the current
+shape was kept because it matches the existing coordinator contract. Switch to
+`batch` if you hit rate limits.
 
 ---
 
-## Other considerations
+## Voice encryption (DAVE)
 
-### Voice encryption (DAVE)
+Discord has enforced DAVE end-to-end encryption on all voice channels since
+2 March 2026, and a bot that does not implement it cannot receive audio at all.
+This is why the project is Python: `discord.py` 2.6+ supports DAVE via the `davey`
+package, while `@discordjs/voice` still cannot decrypt inbound audio
+([discord.js#11419](https://github.com/discordjs/discord.js/issues/11419)).
 
-Discord expects DAVE-capable clients. Keep `discord.py`, `PyNaCl`, `davey`, and related packages current. `discord.py`’s `[voice]` extra (pulled in by `discord-ext-voice-recv`) requires **PyNaCl below 1.6**; this repo matches that range so pip can resolve.
-
-### Transcription language
-
-If `settings.json` has no `stt` block, the app defaults to `en-US` with English alternatives where the code supplies them. Set `stt.language_code` and `stt.alternative_language_codes` for your session ([supported languages](https://cloud.google.com/speech-to-text/docs/speech-to-text-supported-languages)).
-
-### Session-only memory
-
-Conversation state is not persisted across runs; transcript JSON under `transcripts/` is for debugging and analysis.
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull request expectations.
+Keep `discord.py`, `davey`, `PyNaCl` and `discord-ext-voice-recv` current. Note
+that `discord.py[voice]` requires `PyNaCl < 1.6`, so do not pin above that or
+dependency resolution fails.
 
 ---
 
 ## License
 
-This project is released under the MIT License; see the [`LICENSE`](LICENSE) file.
-
----
+MIT — see [`LICENSE`](LICENSE).

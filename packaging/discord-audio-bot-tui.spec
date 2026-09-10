@@ -26,17 +26,15 @@ _default_settings_src = project_root / "settings-example.json"
 hiddenimports = (
     collect_submodules("textual")
     + collect_submodules("discord")
-    + collect_submodules("google.cloud.speech_v1")
-    + collect_submodules("google.cloud.speech_v2")
+    + collect_submodules("google.genai")
     + [
         "discord.ext.voice_recv",
         "discord.ext.commands",
-        "google.genai",
-        "elevenlabs",
+        # DAVE end-to-end encryption; without it discord.py refuses to do voice.
+        "davey",
+        # ElevenLabs is called over plain REST/WebSocket, so no SDK to bundle.
+        "websockets",
         "pydub",
-        "webrtcvad",
-        "google.api_core",
-        "grpc",
         "cryptography",
         "cryptography.fernet",
     ]

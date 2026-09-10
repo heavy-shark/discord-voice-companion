@@ -11,15 +11,32 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Input, Select, TabbedContent, TabPane, TextArea
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Select,
+    Switch,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
 
+from src.conversation import TalkativenessProfile
 from src.main import (
     resolve_mention_window_seconds,
     resolve_reply_cooldown_seconds,
     resolve_reply_silence_seconds,
+    resolve_talkativeness,
 )
 from src.models import Persona
-from src.storage import DEFAULT_STT_LANGUAGE_CODE, SettingsStore
+from src.storage import (
+    DEFAULT_STT_BACKEND,
+    DEFAULT_STT_BATCH_MODEL,
+    DEFAULT_STT_LIVE_MODEL,
+    SettingsStore,
+)
 
 from .gemini_models import DEFAULT_TEXT_MODEL_IDS, list_text_generation_model_ids
 from .layout import SETTINGS_SCREEN_CSS
@@ -36,7 +53,6 @@ from .page.characters import CharacterAliasRow
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CHARACTER_MODEL = "gemini-2.5-flash"
-_DEFAULT_STT_MODEL = "chirp_3"
 
 
 class BotSettingsScreen(Screen[None]):
@@ -201,50 +217,20 @@ class BotSettingsScreen(Screen[None]):
             self.store.resolve_discord_text("server_id", "DISCORD_SERVER_ID") or ""
         )
 
-    def _stt_model_options(self, current_model: str | None = None) -> list[tuple[str, str]]:
-        model_ids: list[str] = []
-        for value in (current_model, "chirp_2", "chirp_3", "telephony"):
-            cleaned = str(value or "").strip()
-            if cleaned and cleaned not in model_ids:
-                model_ids.append(cleaned)
-        return [(model_id, model_id) for model_id in model_ids]
-
-    def _apply_stt_model_options(self, current_model: str | None = None) -> None:
-        select = self.query_one("#stt_google_model", Select)
-        previous_value = self._select_text("#stt_google_model")
-        options = self._stt_model_options(current_model or previous_value or _DEFAULT_STT_MODEL)
-        select.set_options(options)
-        selected_value = (current_model or previous_value or _DEFAULT_STT_MODEL).strip()
-        if any(value == selected_value for _, value in options):
-            select.value = selected_value
-        elif options:
-            select.value = options[0][1]
-
     def _sync_stt_backend_visibility(self, backend: str | None = None) -> None:
-        resolved_backend = (backend or "").strip().lower() or "v1"
-        self.query_one("#stt_v1_fields", Vertical).display = resolved_backend == "v1"
-        self.query_one("#stt_v2_fields", Vertical).display = resolved_backend == "v2"
+        resolved_backend = (backend or "").strip().lower() or DEFAULT_STT_BACKEND
+        self.query_one("#stt_live_fields", Vertical).display = resolved_backend == "live"
+        self.query_one("#stt_batch_fields", Vertical).display = resolved_backend == "batch"
 
     def _load_speech_to_text_fields(self) -> None:
-        stt = self.store.get_stt_config()
-        self.query_one("#stt_primary_language", Input).value = str(
-            stt.get("language_code", DEFAULT_STT_LANGUAGE_CODE)
-        )
-        alternatives = stt.get("alternative_language_codes", [])
-        self.query_one("#stt_alternative_languages", Input).value = ", ".join(
-            str(value) for value in alternatives
-        )
-        backend = (self.store.resolve_stt_speech_backend() or "v1").strip().lower()
-        if backend not in ("v1", "v2"):
-            backend = "v1"
+        backend = self.store.resolve_stt_backend()
         self.query_one("#stt_backend", Select).value = backend
-        self.query_one("#stt_google_api_key", Input).value = self.store.resolve_stt_api_key() or ""
-        self.query_one("#stt_google_application_credentials", Input).value = (
-            self.store.resolve_stt_credentials_path() or ""
+        self.query_one("#stt_language_hints", Input).value = ", ".join(
+            self.store.resolve_stt_language_hints()
         )
-        self.query_one("#stt_google_project_id", Input).value = self.store.resolve_stt_project_id() or ""
-        self.query_one("#stt_google_location", Input).value = self.store.resolve_stt_location() or ""
-        self._apply_stt_model_options(self.store.resolve_stt_model() or _DEFAULT_STT_MODEL)
+        self.query_one("#stt_live_model", Input).value = self.store.resolve_stt_live_model()
+        self.query_one("#stt_batch_model", Input).value = self.store.resolve_stt_batch_model()
+        self.query_one("#stt_emit_interim", Switch).value = self.store.resolve_stt_emit_interim()
         self._sync_stt_backend_visibility(backend)
 
     def _load_text_to_speech_fields(self) -> None:
@@ -263,14 +249,30 @@ class BotSettingsScreen(Screen[None]):
         )
 
     def _load_cooldowns_fields(self) -> None:
-        self.query_one("#cooldown_reply_silence_seconds", Input).value = (
-            f"{resolve_reply_silence_seconds(self.store):g}"
-        )
-        self.query_one("#cooldown_reply_cooldown_seconds", Input).value = (
-            f"{resolve_reply_cooldown_seconds(self.store):g}"
-        )
+        talkativeness = resolve_talkativeness(self.store)
+        profile = TalkativenessProfile.from_dial(talkativeness)
+        self.query_one("#cooldown_talkativeness", Input).value = str(talkativeness)
+
+        silence = resolve_reply_silence_seconds(self.store)
+        cooldown = resolve_reply_cooldown_seconds(self.store)
+        # Blank means "follow the dial"; show the derived value as the placeholder
+        # so the effective timing is still visible.
+        silence_input = self.query_one("#cooldown_reply_silence_seconds", Input)
+        silence_input.value = "" if silence is None else f"{silence:g}"
+        silence_input.placeholder = f"auto ({profile.silence_timeout_seconds:g})"
+
+        cooldown_input = self.query_one("#cooldown_reply_cooldown_seconds", Input)
+        cooldown_input.value = "" if cooldown is None else f"{cooldown:g}"
+        cooldown_input.placeholder = f"auto ({profile.cooldown_seconds:g})"
+
         self.query_one("#cooldown_mention_window_seconds", Input).value = (
             f"{resolve_mention_window_seconds(self.store):g}"
+        )
+        self.query_one("#cooldown_barge_in", Switch).value = self.store.resolve_runtime_bool(
+            "barge_in", "BOT_BARGE_IN", default=True
+        )
+        self.query_one("#cooldown_greet_on_join", Switch).value = self.store.resolve_runtime_bool(
+            "greet_on_join", "BOT_GREET_ON_JOIN", default=True
         )
 
     def _load_pricing_fields(self) -> None:
@@ -317,8 +319,7 @@ class BotSettingsScreen(Screen[None]):
     @on(Select.Changed, "#stt_backend")
     def on_stt_backend_changed(self, event: Select.Changed) -> None:
         backend = "" if event.value in (None, Select.BLANK) else str(event.value).strip().lower()
-        backend = backend or "v1"
-        self._sync_stt_backend_visibility(backend)
+        self._sync_stt_backend_visibility(backend or DEFAULT_STT_BACKEND)
 
     @on(Button.Pressed, "#btn_add_character_alias")
     def on_add_character_alias(self) -> None:
@@ -424,30 +425,16 @@ class BotSettingsScreen(Screen[None]):
 
     @on(Button.Pressed, "#btn_save_stt")
     def on_save_speech_to_text(self) -> None:
-        primary = (
-            self.query_one("#stt_primary_language", Input).value.strip() or DEFAULT_STT_LANGUAGE_CODE
-        )
-        raw_alternatives = self.query_one("#stt_alternative_languages", Input).value
-        alternatives = [entry.strip() for entry in raw_alternatives.split(",") if entry.strip()]
-        if not alternatives:
-            alternatives = ["en-US"]
-        backend = self._select_text("#stt_backend").lower() or "v1"
-        self.store.set_stt_config(
-            primary,
-            alternatives,
-            speech_backend=backend,
-            google_application_credentials=self.query_one(
-                "#stt_google_application_credentials",
-                Input,
-            ).value,
-            project_id=self.query_one("#stt_google_project_id", Input).value,
-            location=self.query_one("#stt_google_location", Input).value,
-            model=self._select_text("#stt_google_model"),
-            update_backend_fields=True,
-        )
-        self.store.apply_stt_api_secrets(
-            google_stt_api_key=self.query_one("#stt_google_api_key", Input).value,
-            google_stt_project_id="",
+        raw_hints = self.query_one("#stt_language_hints", Input).value
+        hints = [entry.strip() for entry in raw_hints.split(",") if entry.strip()]
+        self.store.update_stt_config(
+            backend=self._select_text("#stt_backend").lower() or DEFAULT_STT_BACKEND,
+            live_model=self.query_one("#stt_live_model", Input).value.strip()
+            or DEFAULT_STT_LIVE_MODEL,
+            batch_model=self.query_one("#stt_batch_model", Input).value.strip()
+            or DEFAULT_STT_BATCH_MODEL,
+            language_hints=hints,
+            emit_interim=self.query_one("#stt_emit_interim", Switch).value,
         )
         self.store.save()
         self.notify("Speech-to-Text saved.", title="Settings")
@@ -494,28 +481,65 @@ class BotSettingsScreen(Screen[None]):
         self.notify("Pricing saved.", title="Settings")
 
     @on(Button.Pressed, "#btn_save_cooldowns")
+    def _parse_optional_positive_float_field(
+        self, field_id: str, label: str
+    ) -> tuple[bool, float | str]:
+        """Parse a field where blank means "derive from talkativeness"."""
+        raw_value = self.query_one(field_id, Input).value.strip()
+        if not raw_value:
+            return True, ""
+        try:
+            value = float(raw_value)
+        except ValueError:
+            self.notify(f"{label} must be a number or blank.", title="Settings", severity="error")
+            return False, ""
+        if value <= 0:
+            self.notify(
+                f"{label} must be greater than zero.", title="Settings", severity="error"
+            )
+            return False, ""
+        return True, value
+
     def on_save_cooldowns(self) -> None:
-        silence = self._parse_positive_float_field(
-            "#cooldown_reply_silence_seconds",
-            "Reply silence seconds",
+        raw_talkativeness = self.query_one("#cooldown_talkativeness", Input).value.strip()
+        try:
+            talkativeness = int(round(float(raw_talkativeness)))
+        except ValueError:
+            self.notify(
+                "Talkativeness must be a number from 0 to 100.",
+                title="Settings",
+                severity="error",
+            )
+            return
+        if not 0 <= talkativeness <= 100:
+            self.notify(
+                "Talkativeness must be between 0 and 100.", title="Settings", severity="error"
+            )
+            return
+
+        silence_ok, silence = self._parse_optional_positive_float_field(
+            "#cooldown_reply_silence_seconds", "Reply silence seconds"
         )
-        cooldown = self._parse_positive_float_field(
-            "#cooldown_reply_cooldown_seconds",
-            "Reply cooldown seconds",
+        cooldown_ok, cooldown = self._parse_optional_positive_float_field(
+            "#cooldown_reply_cooldown_seconds", "Reply cooldown seconds"
         )
         mention = self._parse_positive_float_field(
             "#cooldown_mention_window_seconds",
             "Mention window seconds",
         )
-        if silence is None or cooldown is None or mention is None:
+        if not silence_ok or not cooldown_ok or mention is None:
             return
         self.store.update_runtime_config(
+            talkativeness=talkativeness,
             reply_silence_seconds=silence,
             reply_cooldown_seconds=cooldown,
             mention_window_seconds=mention,
+            barge_in=self.query_one("#cooldown_barge_in", Switch).value,
+            greet_on_join=self.query_one("#cooldown_greet_on_join", Switch).value,
         )
         self.store.save()
-        self.notify("Cooldowns saved.", title="Settings")
+        self._load_cooldowns_fields()
+        self.notify("Behaviour saved.", title="Settings")
 
     @on(Button.Pressed, "#btn_close_settings")
     def on_close(self) -> None:

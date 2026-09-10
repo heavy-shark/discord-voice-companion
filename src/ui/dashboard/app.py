@@ -6,7 +6,6 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
-from pathlib import Path
 from typing import ClassVar
 
 from textual import on
@@ -17,11 +16,15 @@ from src.discord import DiscordClient
 from src.main import (
     configure_logging_for_tui,
     get_required_token,
+    resolve_barge_in,
     resolve_greet_on_join,
     resolve_mention_window_seconds,
     resolve_reply_cooldown_seconds,
     resolve_reply_silence_seconds,
+    resolve_require_consent,
+    resolve_spoken_languages,
     resolve_stt_idle_timeout_seconds,
+    resolve_talkativeness,
     voice_user_audio_allowed,
 )
 from src.session import ConversationRunnerConfig, SessionMetrics, run_voice_conversation
@@ -435,34 +438,18 @@ class BotDashboardApp(App[None]):
         if not gemini_key:
             self._set_status("Set the Gemini API key in Settings > Text-to-Speech or .env.")
             return
-        stt_backend = (self._settings_store.resolve_stt_speech_backend() or "").strip().lower()
-        stt_key = self._settings_store.resolve_stt_api_key()
-        stt_credentials_path = self._settings_store.resolve_stt_credentials_path()
-        stt_project = self._settings_store.resolve_stt_project_id()
-        stt_location = self._settings_store.resolve_stt_location()
-        stt_model = self._settings_store.resolve_stt_model()
-        use_stt_v2 = stt_backend == "v2" or (
-            not stt_backend
-            and any(value for value in (stt_credentials_path, stt_project, stt_location, stt_model))
+        # Transcription runs on the same Gemini key as the conversation, so the
+        # check above already covers it; only the model name can still be blank.
+        stt_backend = self._settings_store.resolve_stt_backend()
+        stt_model = (
+            self._settings_store.resolve_stt_live_model()
+            if stt_backend == "live"
+            else self._settings_store.resolve_stt_batch_model()
         )
-        if use_stt_v2:
-            if not stt_credentials_path:
-                self._set_status("Set the STT service account JSON path in Settings > Speech-to-Text.")
-                return
-            if not Path(stt_credentials_path).exists():
-                self._set_status("The STT service account JSON path does not exist.")
-                return
-            if not stt_project:
-                self._set_status("Set the Google STT project ID in Settings > Speech-to-Text.")
-                return
-            if not stt_location:
-                self._set_status("Set the Google STT location in Settings > Speech-to-Text.")
-                return
-            if not stt_model:
-                self._set_status("Set the Google STT model in Settings > Speech-to-Text.")
-                return
-        elif not stt_key:
-            self._set_status("Set the Google STT API key in Settings > Speech-to-Text or .env.")
+        if not stt_model:
+            self._set_status(
+                f"Set the {stt_backend} transcription model in Settings > Speech-to-Text."
+            )
             return
         elevenlabs_key = resolve_elevenlabs_api_key(self._settings_store)
         if not elevenlabs_key:
@@ -526,11 +513,14 @@ class BotDashboardApp(App[None]):
                 raise RuntimeError("Voice client missing after join.")
             config = ConversationRunnerConfig(
                 stt_idle_timeout_seconds=resolve_stt_idle_timeout_seconds(),
-                reply_silence_seconds=resolve_reply_silence_seconds(self._settings_store),
-                reply_cooldown_seconds=resolve_reply_cooldown_seconds(self._settings_store),
                 mention_window_seconds=resolve_mention_window_seconds(self._settings_store),
                 greet_on_join=resolve_greet_on_join(self._settings_store),
                 reply_locale=resolve_bot_reply_language_code(self._settings_store),
+                talkativeness=resolve_talkativeness(self._settings_store),
+                spoken_languages=resolve_spoken_languages(self._settings_store),
+                reply_silence_seconds=resolve_reply_silence_seconds(self._settings_store),
+                reply_cooldown_seconds=resolve_reply_cooldown_seconds(self._settings_store),
+                barge_in=resolve_barge_in(self._settings_store),
             )
             await run_voice_conversation(
                 self._discord,
@@ -542,7 +532,10 @@ class BotDashboardApp(App[None]):
                 persona_id=persona_id,
                 external_stop_event=self._stop_event,
                 metrics=self._metrics,
-                user_audio_allowed=voice_user_audio_allowed(self._discord),
+                user_audio_allowed=voice_user_audio_allowed(
+                    self._discord,
+                    require_consent=resolve_require_consent(self._settings_store),
+                ),
             )
         except asyncio.CancelledError:
             raise

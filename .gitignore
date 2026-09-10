@@ -1,7 +1,7 @@
-# Environment variables
-.env
-.env.local
-.env.*.local
+# NOTE: .env and settings.json are deliberately NOT ignored.
+# The deployment panel clones this repo and runs it as-is, so the config has to
+# travel with the code. That puts API keys in the repository history —
+# KEEP THIS REPOSITORY PRIVATE.
 
 # Python
 __pycache__/
@@ -10,37 +10,26 @@ __pycache__/
 *.so
 *.egg
 *.egg-info/
-dist/
-build/
-# Populated by packaging/ensure_ffmpeg_windows.py (FFmpeg exe cache for PyInstaller)
-build/ffmpeg-win-cache/
 .Python
-env/
-venv/
-ENV/
-build/
 develop-eggs/
 dist/
-downloads/
+build/
 eggs/
 .eggs/
-lib/
-lib64/
 parts/
 sdist/
 var/
 wheels/
 pip-wheel-metadata/
 share/python-wheels/
-*.egg-info/
 .installed.cfg
-*.egg
 MANIFEST
 
 # Virtual environments
+.venv/
 venv/
 env/
-.venv/
+ENV/
 
 # IDE
 .vscode/
@@ -48,30 +37,21 @@ env/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Credentials and sensitive files
-*.json.backup
-service-account-key.json
-API_KEY
-apikey.txt
-
-# Transcripts and session logs
+# Runtime output
 transcripts/
 consent/
+logs/
 *.log
 
-# Google Cloud Service Account Credentials
-service_accounts/
+# Local settings encryption key (machine-specific, never share)
+.discord_audio_bot_settings_key
 
 # Temporary files
 *.tmp
 *.temp
+*.json.backup
 .ipynb_checkpoints/
-
-# App settings
-settings.json
-.discord_audio_bot_settings_key
 
 # OS
 .DS_Store

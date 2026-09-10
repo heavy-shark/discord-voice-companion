@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Input, Label, Select
+from textual.widgets import Button, Input, Label, Select, Switch
 
-from src.storage import DEFAULT_STT_LANGUAGE_CODE
+from src.storage import (
+    DEFAULT_STT_BATCH_MODEL,
+    DEFAULT_STT_LANGUAGE_HINTS,
+    DEFAULT_STT_LIVE_MODEL,
+)
 
 
 class SpeechToTextSettingsPage(Vertical):
@@ -19,45 +23,37 @@ class SpeechToTextSettingsPage(Vertical):
         with VerticalScroll(classes="settings_scroll"):
             with Vertical(classes="settings_form"):
                 with Vertical(classes="settings_field_group"):
-                    yield Label("Primary language (BCP-47)")
-                    yield Input(id="stt_primary_language", placeholder=DEFAULT_STT_LANGUAGE_CODE)
-                with Vertical(classes="settings_field_group"):
-                    yield Label("Alternative languages (BCP-47, comma-separated)")
-                    yield Input(id="stt_alternative_languages", placeholder="en-US, en-GB")
-                with Vertical(classes="settings_field_group"):
-                    yield Label("Google STT backend")
+                    yield Label("Transcription backend")
                     yield Select(
-                        [("v1", "v1"), ("v2", "v2")],
+                        [
+                            ("live (streaming, lowest latency)", "live"),
+                            ("batch (one request per utterance)", "batch"),
+                        ],
                         id="stt_backend",
-                        prompt="Select STT backend...",
+                        prompt="Select transcription backend...",
                     )
-                with Vertical(id="stt_v1_fields"):
+                with Vertical(classes="settings_field_group"):
+                    yield Label("Language hints (BCP-47, comma-separated; blank = auto-detect)")
+                    yield Input(
+                        id="stt_language_hints",
+                        placeholder=", ".join(DEFAULT_STT_LANGUAGE_HINTS),
+                    )
+                with Vertical(id="stt_live_fields"):
                     with Vertical(classes="settings_field_group"):
-                        yield Label("Google STT API key")
+                        yield Label("Live transcription model")
                         yield Input(
-                            id="stt_google_api_key",
-                            placeholder="GOOGLE_STT_API_KEY",
-                            password=True,
-                        )
-                with Vertical(id="stt_v2_fields"):
-                    with Vertical(classes="settings_field_group"):
-                        yield Label("Service account JSON path")
-                        yield Input(
-                            id="stt_google_application_credentials",
-                            placeholder="C:\\path\\to\\service-account.json",
+                            id="stt_live_model",
+                            placeholder=DEFAULT_STT_LIVE_MODEL,
                         )
                     with Vertical(classes="settings_field_group"):
-                        yield Label("Google STT project ID")
-                        yield Input(id="stt_google_project_id", placeholder="GOOGLE_STT_PROJECT_ID")
+                        yield Label("Show partial transcripts while someone is speaking")
+                        yield Switch(id="stt_emit_interim")
+                with Vertical(id="stt_batch_fields"):
                     with Vertical(classes="settings_field_group"):
-                        yield Label("Google STT location")
-                        yield Input(id="stt_google_location", placeholder="eu")
-                    with Vertical(classes="settings_field_group"):
-                        yield Label("Google STT model")
-                        yield Select(
-                            [("chirp_2", "chirp_2"), ("chirp_3", "chirp_3"), ("telephony", "telephony")],
-                            id="stt_google_model",
-                            prompt="Select STT model...",
+                        yield Label("Batch transcription model")
+                        yield Input(
+                            id="stt_batch_model",
+                            placeholder=DEFAULT_STT_BATCH_MODEL,
                         )
         with Horizontal(classes="settings_action_row"):
             yield Button("Save Speech-to-Text", id="btn_save_stt", variant="success")

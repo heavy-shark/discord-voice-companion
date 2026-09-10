@@ -1,11 +1,15 @@
 {
     "personas": [
         {
-        "id": "default",
-        "name": "Default Bot",
-        "system_instruction": "You are a helpful Discord bot in a voice channel conversation. Be concise (1-2 sentences), friendly, and conversational. Respond naturally to what people say.",
-        "genai_model": "gemini-2.5-flash",
-        "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb"
+            "id": "default",
+            "name": "Companion",
+            "alternative_names": [
+                "компаньйон",
+                "компаньон"
+            ],
+            "system_instruction": "You are hanging out in a Discord voice channel with friends. You are a participant in the conversation, not an assistant waiting for commands. Keep replies to 1-2 short spoken sentences - people are listening, not reading. Have opinions, react to what was actually said, and ask a follow-up when you are curious. Do not narrate what you are doing, do not offer help unprompted, and never start a reply with a greeting unless someone just arrived.",
+            "genai_model": "gemini-2.5-flash",
+            "elevenlabs_voice_id": "JBFqnCBsd6RMkjVDRZzb"
         }
     ],
     "ui": {
@@ -14,9 +18,23 @@
         "last_persona_id": "default"
     },
     "stt": {
-        "language_code": "en-US",
-        "alternative_language_codes": [
-        "en-GB"
-        ]
+        "backend": "live",
+        "live_model": "gemini-3.5-transcribe-live",
+        "batch_model": "gemini-2.5-flash",
+        "language_hints": [
+            "uk-UA",
+            "ru-RU",
+            "en-US"
+        ],
+        "emit_interim": true
+    },
+    "runtime": {
+        "talkativeness": 65,
+        "reply_silence_seconds": "",
+        "reply_cooldown_seconds": "",
+        "mention_window_seconds": 30,
+        "reply_language": "",
+        "greet_on_join": true,
+        "barge_in": true
     }
 }

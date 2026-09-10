@@ -3,9 +3,9 @@ requires = ["setuptools>=82.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "discord-audio-bot"
-version = "1.1.1"
-description = "A Discord voice-channel conversational character bot"
+name = "discord-companion"
+version = "2.0.0"
+description = "A Discord voice-channel companion bot (Gemini STT + Gemini chat + ElevenLabs TTS)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -20,15 +20,14 @@ dependencies = [
     "discord-ext-voice-recv>=0.5.2a179",
     "davey>=0.1.5",
     
-    # Transcription
-    "google-cloud-speech>=2.38.0",
-    
-    # GenAI / Conversation
-    "google-genai>=1.73.0",
-    
-    # Text-to-Speech
-    "elevenlabs>=2.43.0",
-    
+    # Transcription + conversation (Gemini Live API transcription needs >=1.33)
+    "google-genai>=1.33.0",
+
+    # Text-to-Speech: ElevenLabs is called over plain REST/WebSocket, so the
+    # official SDK is deliberately not a dependency (it also breaks pip installs
+    # on Windows without long-path support).
+    "websockets>=13.0",
+
     # TUI
     "textual>=8.2.3",
     
@@ -37,11 +36,8 @@ dependencies = [
     
     # Audio processing
     "PyNaCl>=1.5.0,<1.6",  # Must match discord.py ``[voice]`` extra (``discord-ext-voice-recv`` requires voice)
-    "pydub>=0.25.1",  # Audio manipulation
-    
-    # Voice Activity Detection (PyPI: ``webrtcvad``, not ``webrtc-vad``; 2.x is current)
-    "webrtcvad>=2.0.10",
-    
+    "pydub>=0.25.1",  # Audio manipulation (file-playback smoke test only)
+
     # Utilities
     "pydantic>=2.13.0",  # Data validation
     "httpx>=0.28.1",  # Async HTTP client for ElevenLabs
@@ -49,7 +45,7 @@ dependencies = [
 ]
 
 [project.scripts]
-discord-audio-bot = "src.main:main"
+discord-companion = "src.main:main"
 
 [project.optional-dependencies]
 build = [

@@ -8,7 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.main import get_required_token, resolve_greet_on_join, resolve_reply_cooldown_seconds
-from src.storage import SettingsStore
+from src.storage import (
+    DEFAULT_STT_BACKEND,
+    DEFAULT_STT_BATCH_MODEL,
+    DEFAULT_STT_LANGUAGE_HINTS,
+    DEFAULT_STT_LIVE_MODEL,
+    SettingsStore,
+)
 from src.tts import resolve_elevenlabs_api_key
 
 
@@ -125,8 +131,6 @@ def test_discord_token_prefers_settings_over_env(tmp_path: Path) -> None:
     )
     store.set_api_config(
         google_gemini_api_key="",
-        google_stt_api_key="",
-        google_stt_project_id="",
         elevenlabs_api_key="",
     )
 
@@ -142,8 +146,6 @@ def test_elevenlabs_key_prefers_settings_over_env(tmp_path: Path) -> None:
     )
     store.set_api_config(
         google_gemini_api_key="",
-        google_stt_api_key="",
-        google_stt_project_id="",
         elevenlabs_api_key="settings-eleven",
     )
 
@@ -155,40 +157,64 @@ def test_elevenlabs_key_prefers_settings_over_env(tmp_path: Path) -> None:
         assert resolve_elevenlabs_api_key(store) == "settings-eleven"
 
 
-def test_resolve_stt_project_id_prefers_settings_over_env(tmp_path: Path) -> None:
+def test_resolve_stt_backend_prefers_settings_over_env(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.set_stt_config(
-        "da-DK",
-        ["en-US"],
-        project_id="settings-project",
-        update_backend_fields=True,
-    )
+    store.update_stt_config(backend="batch")
+    with patch.dict(os.environ, {"GEMINI_STT_BACKEND": "live"}, clear=False):
+        assert store.resolve_stt_backend() == "batch"
 
+
+def test_resolve_stt_backend_falls_back_to_env_then_default(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with patch.dict(os.environ, {"GEMINI_STT_BACKEND": "batch"}, clear=False):
+        assert store.resolve_stt_backend() == "batch"
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GEMINI_STT_BACKEND", None)
+        assert store.resolve_stt_backend() == DEFAULT_STT_BACKEND
+
+
+def test_resolve_stt_backend_rejects_unknown_values(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.update_stt_config(backend="whisper")
+    assert store.resolve_stt_backend() == DEFAULT_STT_BACKEND
+
+
+def test_resolve_stt_models_prefer_settings_over_env(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.update_stt_config(live_model="settings-live", batch_model="settings-batch")
     with patch.dict(
         os.environ,
-        {"GOOGLE_STT_PROJECT_ID": "env-project", "GOOGLE_CLOUD_PROJECT": "env-cloud-project"},
+        {"GEMINI_STT_LIVE_MODEL": "env-live", "GEMINI_STT_BATCH_MODEL": "env-batch"},
         clear=False,
     ):
-        assert store.resolve_stt_project_id() == "settings-project"
+        assert store.resolve_stt_live_model() == "settings-live"
+        assert store.resolve_stt_batch_model() == "settings-batch"
 
 
-def test_resolve_stt_api_key_prefers_settings_over_env(tmp_path: Path) -> None:
+def test_resolve_stt_models_default_when_unset(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.set_api_config(
-        google_gemini_api_key="",
-        google_stt_api_key="settings-stt-key",
-        google_stt_project_id="",
-        elevenlabs_api_key="",
-    )
-    with patch.dict(os.environ, {"GOOGLE_STT_API_KEY": "env-stt-key"}, clear=False):
-        assert store.resolve_stt_api_key() == "settings-stt-key"
+    for key in ("GEMINI_STT_LIVE_MODEL", "GEMINI_STT_BATCH_MODEL"):
+        os.environ.pop(key, None)
+    assert store.resolve_stt_live_model() == DEFAULT_STT_LIVE_MODEL
+    assert store.resolve_stt_batch_model() == DEFAULT_STT_BATCH_MODEL
 
 
-def test_resolve_stt_speech_backend_prefers_settings_over_env(tmp_path: Path) -> None:
+def test_resolve_stt_language_hints_defaults_to_uk_ru_en(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.set_stt_config("da-DK", ["en-US"], speech_backend="v1", update_backend_fields=True)
-    with patch.dict(os.environ, {"GOOGLE_STT_SPEECH_BACKEND": "v2"}, clear=False):
-        assert store.resolve_stt_speech_backend() == "v1"
+    os.environ.pop("GEMINI_STT_LANGUAGE_HINTS", None)
+    assert store.resolve_stt_language_hints() == list(DEFAULT_STT_LANGUAGE_HINTS)
+
+
+def test_resolve_stt_language_hints_accepts_a_comma_separated_string(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.update_stt_config(language_hints="uk-UA, pl-PL ,, en-GB")
+    assert store.resolve_stt_language_hints() == ["uk-UA", "pl-PL", "en-GB"]
+
+
+def test_resolve_stt_language_hints_can_be_emptied_for_pure_auto_detect(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.update_stt_config(language_hints=[])
+    assert store.resolve_stt_language_hints() == []
 
 
 def test_discord_server_id_prefers_settings_over_env(tmp_path: Path) -> None:

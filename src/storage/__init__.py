@@ -4,7 +4,14 @@ Handles settings management, configuration persistence, and data storage.
 """
 
 from .consent import ConsentAcceptEvent, ConsentStore
-from .settings import DEFAULT_STT_LANGUAGE_CODE, SettingsStore
+from .settings import (
+    AUTO_REPLY_LOCALE,
+    DEFAULT_STT_BACKEND,
+    DEFAULT_STT_BATCH_MODEL,
+    DEFAULT_STT_LANGUAGE_HINTS,
+    DEFAULT_STT_LIVE_MODEL,
+    SettingsStore,
+)
 from .transcripts import (
     TranscriptScrubStats,
     TranscriptSessionWriter,
@@ -12,9 +19,13 @@ from .transcripts import (
 )
 
 __all__ = [
+    "AUTO_REPLY_LOCALE",
     "ConsentAcceptEvent",
     "ConsentStore",
-    "DEFAULT_STT_LANGUAGE_CODE",
+    "DEFAULT_STT_BACKEND",
+    "DEFAULT_STT_BATCH_MODEL",
+    "DEFAULT_STT_LANGUAGE_HINTS",
+    "DEFAULT_STT_LIVE_MODEL",
     "SettingsStore",
     "TranscriptScrubStats",
     "TranscriptSessionWriter",

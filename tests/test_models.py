@@ -120,7 +120,9 @@ class TestUsageCounters:
         assert counters.output_tokens == 0
         assert counters.total_tokens == 0
         assert counters.tts_seconds_generated == 0.0
-        assert counters.session_duration_seconds > 0
+        # Windows' time.time() resolution can make this exactly 0.0 right after
+        # construction, so the only safe assertion is "not negative".
+        assert counters.session_duration_seconds >= 0
 
     def test_total_tokens_property(self):
         counters = UsageCounters(input_tokens=30, output_tokens=12)
