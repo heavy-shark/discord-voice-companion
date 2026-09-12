@@ -68,6 +68,14 @@ commented). Nothing else is required.
 > the config. **Keep the repository private.** If it is ever public, rotate all
 > three keys.
 
+**Required intent.** In the Developer Portal → your app → **Bot** → *Privileged
+Gateway Intents*, switch on **SERVER MEMBERS INTENT**. The bot needs the member
+cache to attribute received audio to a speaker; without it, people who were
+already sitting in the channel before the bot joined are never resolved and
+their audio is discarded, so the bot looks deaf to exactly those people. The
+gateway refuses the connection outright if the code asks for the intent and the
+toggle is off — the startup log says so explicitly if that happens.
+
 **Inviting the bot.** In the Developer Portal → OAuth2 → URL Generator, tick
 scopes **`bot`** and **`applications.commands`**, and bot permissions **Connect**
 and **Speak**. Open the generated URL and add it to your server.

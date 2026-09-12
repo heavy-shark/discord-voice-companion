@@ -25,16 +25,31 @@ def runner_config() -> ConversationRunnerConfig:
 
 
 class FakeDiscordClient:
-    def __init__(self) -> None:
+    def __init__(self, *, join_error_after: int | None = None) -> None:
         self.joined: list[int] = []
         self.left = 0
+        # Number of successful joins before ``join_voice_channel`` starts failing.
+        self._join_error_after = join_error_after
 
     async def join_voice_channel(self, channel_id: int) -> object:
+        if self._join_error_after is not None and len(self.joined) >= self._join_error_after:
+            raise RuntimeError("voice gateway is down")
         self.joined.append(channel_id)
         return SimpleNamespace(channel=SimpleNamespace(id=channel_id, name="Lobby"))
 
     async def leave_voice_channel(self) -> None:
         self.left += 1
+
+
+async def wait_until(predicate, *, timeout: float = 2.0) -> bool:
+    """Poll *predicate* on the event loop until it holds or the timeout expires."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
 
 
 class FakeSettingsStore:
@@ -60,9 +75,12 @@ def build_service(
     runner,
     *,
     settings: FakeSettingsStore | None = None,
+    discord_client: FakeDiscordClient | None = None,
 ) -> tuple[CompanionService, FakeDiscordClient]:
     monkeypatch.setattr(service_module, "run_voice_conversation", runner)
-    discord_client = FakeDiscordClient()
+    # Rejoin backoff would otherwise make every failure test wait seconds.
+    monkeypatch.setattr(service_module, "_REJOIN_BASE_DELAY_SECONDS", 0.0)
+    discord_client = discord_client or FakeDiscordClient()
     service = CompanionService(
         discord_client,  # type: ignore[arg-type]
         settings or FakeSettingsStore(),  # type: ignore[arg-type]
@@ -125,18 +143,80 @@ async def test_a_failing_session_returns_to_idle_instead_of_crashing(
     service, discord_client = build_service(monkeypatch, runner)
 
     await service.join(7, "Lobby")
-    # Let the session task run and fail.
-    for _ in range(10):
-        await asyncio.sleep(0)
-        if not service.is_running:
-            break
+    assert await wait_until(lambda: not service.is_running)
 
-    assert not service.is_running
     status = service.status()
     assert status.is_active is False
     assert "gemini exploded" in status.last_error
     # It left the channel it could not work in.
     assert discord_client.left >= 1
+    # It tried the channel again before giving up, rather than idling on the
+    # first blip.
+    assert discord_client.joined == [7] * (1 + service_module._REJOIN_ATTEMPTS)
+
+
+async def test_a_dropped_session_rejoins_the_same_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A voice websocket drop must not leave the bot silently out of the channel."""
+    attempts = 0
+
+    async def runner(**kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("voice websocket closed")
+        await kwargs["external_stop_event"].wait()
+
+    service, discord_client = build_service(monkeypatch, runner)
+
+    await service.join(7, "Lobby")
+    assert await wait_until(lambda: attempts >= 2)
+
+    assert service.is_running
+    assert discord_client.joined == [7, 7]
+    assert service.status().channel_id == 7
+
+    await service.leave()
+    assert not service.is_running
+
+
+async def test_a_rejoin_that_cannot_connect_returns_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def runner(**_kwargs) -> None:
+        raise RuntimeError("session died")
+
+    service, discord_client = build_service(
+        monkeypatch,
+        runner,
+        discord_client=FakeDiscordClient(join_error_after=1),
+    )
+
+    await service.join(7, "Lobby")
+    assert await wait_until(lambda: not service.is_running)
+
+    assert discord_client.joined == [7]
+    assert "voice gateway is down" in service.status().last_error
+
+
+async def test_a_session_that_fails_while_stopping_is_not_rejoined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/leave`` means leave, even if the session throws on the way out."""
+
+    async def runner(**kwargs) -> None:
+        await kwargs["external_stop_event"].wait()
+        raise RuntimeError("blew up during shutdown")
+
+    service, discord_client = build_service(monkeypatch, runner)
+
+    await service.join(7, "Lobby")
+    await asyncio.sleep(0)
+    await service.leave()
+
+    assert not service.is_running
+    assert discord_client.joined == [7]
 
 
 async def test_leave_is_a_no_op_when_nothing_is_running(

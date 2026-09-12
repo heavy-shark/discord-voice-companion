@@ -125,6 +125,7 @@ class FakeGatewayClient:
         self._ready = False
         self._close_event = asyncio.Event()
         self.started_with: str | None = None
+        self.start_calls: list[str] = []
         self.user = "fake-bot"
 
     def event(self, coro):
@@ -133,6 +134,7 @@ class FakeGatewayClient:
 
     async def start(self, token: str) -> None:
         self.started_with = token
+        self.start_calls.append(token)
         if self._start_error is not None:
             raise self._start_error
 
@@ -262,6 +264,32 @@ def test_connect_waits_for_ready() -> None:
         assert fake_client.started_with == "token123"
         assert fake_client.intents.guilds is True
         assert fake_client.intents.voice_states is True
+        # Speaker attribution needs the member cache, or audio from people who
+        # were already in the channel is dropped unattributed.
+        assert fake_client.intents.members is True
+
+        await discord_client.disconnect()
+
+    run_async(scenario())
+
+
+def test_a_missing_privileged_intent_is_reported_with_the_portal_fix(caplog) -> None:
+    """The gateway refuses the connection outright; say which toggle is off."""
+
+    async def scenario() -> None:
+        fake_client = FakeGatewayClient(
+            intents=None,
+            start_error=client_module.discord.PrivilegedIntentsRequired(shard_id=None),
+        )
+        discord_client = DiscordClient("token123", client_factory=make_client_factory(fake_client))
+
+        with caplog.at_level(logging.ERROR, logger="src.discord.client"):
+            with pytest.raises(RuntimeError, match="startup failed"):
+                await discord_client.connect()
+
+        assert "SERVER MEMBERS INTENT" in caplog.text
+        # It is not a transient failure: no point burning the retry budget.
+        assert len(fake_client.start_calls) == 1
 
         await discord_client.disconnect()
 
@@ -334,7 +362,8 @@ def test_join_voice_channel_validates_and_stores_active_client(monkeypatch) -> N
         assert joined_voice_client is voice_channel.voice_client
         assert discord_client.voice_client is joined_voice_client
         assert voice_channel.connect_calls[0]["cls"] is client_module.VoiceRecvClient
-        assert voice_channel.connect_calls[0]["reconnect"] is False
+        # A voice websocket blip must be retried, not left connected-but-deaf.
+        assert voice_channel.connect_calls[0]["reconnect"] is True
 
         await discord_client.disconnect()
 

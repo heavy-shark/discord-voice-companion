@@ -140,6 +140,11 @@ class DiscordClient:
         intents = discord.Intents.none()
         intents.guilds = True
         intents.voice_states = True
+        # Speaker attribution goes through guild.get_member(); without the member
+        # cache, audio from people who were already in the channel before the bot
+        # joined is dropped unattributed and the bot looks deaf to exactly them.
+        # Requires "Server Members Intent" in Developer Portal -> Bot.
+        intents.members = True
         client = self._client_factory(intents=intents)
         # Test doubles may omit ``http``; :class:`app_commands.CommandTree` requires a real client.
         if getattr(client, "http", None) is not None:
@@ -362,6 +367,13 @@ class DiscordClient:
             except RuntimeError as exc:
                 last_error = exc
                 cause = exc.__cause__
+                if isinstance(cause, discord.PrivilegedIntentsRequired):
+                    logger.error(
+                        "Discord refused the connection: this bot needs a privileged intent that "
+                        "is switched off. Open the Developer Portal -> your application -> Bot -> "
+                        "Privileged Gateway Intents and enable SERVER MEMBERS INTENT, then restart."
+                    )
+                    raise
                 if attempt >= _GATEWAY_RETRY_ATTEMPTS or not _transient_gateway_failure(cause):
                     raise
                 delay = min(
@@ -414,9 +426,11 @@ class DiscordClient:
         logger.info("Joining voice channel %s (%s)...", channel.name, channel.id)
 
         try:
+            # reconnect=True: a voice websocket blip must be retried by discord.py,
+            # not left as a connected-but-dead client that silently hears nothing.
             voice_client = await channel.connect(
                 cls=VoiceRecvClient,
-                reconnect=False,
+                reconnect=True,
                 self_deaf=False,
                 self_mute=False,
             )

@@ -33,6 +33,32 @@ logger = logging.getLogger(__name__)
 
 _DISCORD_NICKNAME_MAX_LEN = 32
 
+# Gemini 429s and ElevenLabs 401s (free tier runs out at 10 000 characters) are
+# per-reply failures, not session failures. Keep answering the room until a long
+# unbroken streak says the service is really gone.
+_MAX_CONSECUTIVE_REPLY_FAILURES = 10
+
+
+class ReplyPipelineError(RuntimeError):
+    """Raised when reply generation fails often enough that the session should end."""
+
+
+def _log_finished_session_task(task: asyncio.Task[None], metrics: SessionMetrics | None) -> None:
+    """Say *why* the voice session is unwinding; the panel only sees the bot leave."""
+    name = task.get_name()
+    if task.cancelled():
+        logger.warning("Voice session ending: task %r was cancelled.", name)
+        return
+
+    error = task.exception()
+    if error is None:
+        logger.info("Voice session ending: task %r finished normally.", name)
+        return
+
+    logger.error("Voice session ending: task %r failed: %s", name, error, exc_info=error)
+    if metrics is not None:
+        metrics.last_error = f"{name}: {error}"
+
 
 def _persona_mention_trigger_sources(persona: Persona) -> list[str]:
     """Display name plus configured transcript aliases (order preserved for policy dedupe)."""
@@ -262,12 +288,19 @@ async def run_voice_conversation(
             metrics.status_line = f"interrupted by {username}"
         asyncio.create_task(playback_manager.stop_playback(), name="barge-in-stop")
 
+    def on_transcription_error(error: BaseException, consecutive_failures: int) -> None:
+        """Surface dropped utterances in ``/status`` instead of ending the session."""
+        if metrics is not None:
+            metrics.last_error = f"transcription failed ({consecutive_failures} in a row): {error}"
+            metrics.status_line = "transcription error"
+
     coordinator = PerUserTranscriptionCoordinator(
         stt_client=stt_client,
         segment_handler=handle_final_segment,
         idle_timeout_seconds=runner_config.stt_idle_timeout_seconds,
         on_stt_audio_seconds=on_stt_audio_seconds,
         on_speech_started=on_speech_started,
+        on_transcription_error=on_transcription_error,
     )
     consumer_stop_event = asyncio.Event()
     consumer_task = asyncio.create_task(
@@ -298,14 +331,22 @@ async def run_voice_conversation(
                 spoken_languages=runner_config.spoken_languages,
             )
             await chat_manager.create_chat_session(persona)
-            greeting = await chat_manager.send_message(greeting_prompt)
-            conversation_log.add_bot_turn(greeting)
-            policy.record_bot_reply()
-            transcript_writer.add_bot_reply(greeting, label="greeting")
-            bump_metrics_tokens()
-            logger.info("Join greeting | %s", greeting)
-            await speak_bot_text(greeting, persona)
             chat_session_ready = True
+            try:
+                greeting = await chat_manager.send_message(greeting_prompt)
+                conversation_log.add_bot_turn(greeting)
+                policy.record_bot_reply()
+                transcript_writer.add_bot_reply(greeting, label="greeting")
+                bump_metrics_tokens()
+                logger.info("Join greeting | %s", greeting)
+                await speak_bot_text(greeting, persona)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Not being able to say hello is no reason to refuse to listen.
+                logger.warning("Join greeting failed; continuing without it: %s", exc, exc_info=True)
+                if metrics is not None:
+                    metrics.last_error = f"join greeting failed: {exc}"
 
         if not chat_session_ready:
             await chat_manager.create_chat_session(persona)
@@ -324,6 +365,7 @@ async def run_voice_conversation(
         reply_lock = asyncio.Lock()
 
         async def supervise_loop() -> None:
+            consecutive_reply_failures = 0
             while supervisor_stop["go"] and not consumer_stop_event.is_set():
                 await asyncio.sleep(0.25)
                 if consumer_stop_event.is_set():
@@ -348,30 +390,58 @@ async def run_voice_conversation(
 
                     transcript_block = conversation_log.get_conversation_for_prompt()
 
-                    # Nobody addressed the bot: ask whether this is worth saying
-                    # before spending a full reply on it.
-                    if reason is TriggerReason.VOLUNTEERED:
+                    try:
+                        # Nobody addressed the bot: ask whether this is worth saying
+                        # before spending a full reply on it.
+                        if reason is TriggerReason.VOLUNTEERED:
+                            if metrics is not None:
+                                metrics.status_line = "deciding whether to chime in"
+                            if not await chat_manager.should_volunteer(transcript_block):
+                                policy.record_declined_reply()
+                                continue
+
+                        logger.info("Reply trigger fired (%s).", reason.value)
                         if metrics is not None:
-                            metrics.status_line = "deciding whether to chime in"
-                        if not await chat_manager.should_volunteer(transcript_block):
-                            policy.record_declined_reply()
-                            continue
+                            metrics.status_line = "generating reply"
 
-                    logger.info("Reply trigger fired (%s).", reason.value)
-                    if metrics is not None:
-                        metrics.status_line = "generating reply"
+                        # Voice receive stays on throughout: the bot keeps hearing the
+                        # room while it thinks and speaks, which is what makes
+                        # barge-in and follow-up context work.
+                        prompt = chat_manager.format_conversation_prompt(transcript_block)
+                        reply = await chat_manager.send_message(prompt)
+                        conversation_log.add_bot_turn(reply)
+                        policy.record_bot_reply()
+                        transcript_writer.add_bot_reply(reply, label=reason.value)
+                        bump_metrics_tokens()
+                        logger.info("Bot reply | %s", reply)
+                        await speak_bot_text(reply, persona)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # Gemini 429 or ElevenLabs 401 (free-tier characters gone).
+                        # Drop this reply, back off, and keep the session alive.
+                        consecutive_reply_failures += 1
+                        logger.error(
+                            "Reply generation failed; skipping this turn. "
+                            "%d failure(s) in a row, giving up at %d.",
+                            consecutive_reply_failures,
+                            _MAX_CONSECUTIVE_REPLY_FAILURES,
+                            exc_info=exc,
+                        )
+                        if metrics is not None:
+                            metrics.last_error = (
+                                f"reply failed ({consecutive_reply_failures} in a row): {exc}"
+                            )
+                            metrics.status_line = "reply error"
+                        policy.record_declined_reply()
+                        if consecutive_reply_failures >= _MAX_CONSECUTIVE_REPLY_FAILURES:
+                            raise ReplyPipelineError(
+                                f"Reply generation failed {consecutive_reply_failures} times "
+                                f"in a row (last error: {exc})."
+                            ) from exc
+                        continue
 
-                    # Voice receive stays on throughout: the bot keeps hearing the
-                    # room while it thinks and speaks, which is what makes
-                    # barge-in and follow-up context work.
-                    prompt = chat_manager.format_conversation_prompt(transcript_block)
-                    reply = await chat_manager.send_message(prompt)
-                    conversation_log.add_bot_turn(reply)
-                    policy.record_bot_reply()
-                    transcript_writer.add_bot_reply(reply, label=reason.value)
-                    bump_metrics_tokens()
-                    logger.info("Bot reply | %s", reply)
-                    await speak_bot_text(reply, persona)
+                    consecutive_reply_failures = 0
 
         async def on_voice_user_joined(member: discord.Member) -> None:
             display_name = (
@@ -421,6 +491,8 @@ async def run_voice_conversation(
             {consumer_task, runtime_task, supervisor_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
+        for finished in done:
+            _log_finished_session_task(finished, metrics)
         for finished in done:
             await finished
     except BaseException as exc:

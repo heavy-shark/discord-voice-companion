@@ -7,7 +7,11 @@ Utterance segmentation is driven by Discord's own speaking state plus an idle
 gap (see :mod:`.coordinator`), so there is no local VAD.
 """
 
-from .coordinator import PerUserTranscriptionCoordinator
+from .coordinator import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    PerUserTranscriptionCoordinator,
+    TranscriptionUnavailableError,
+)
 from .gemini_stt import GeminiSTTClient, GeminiSTTError
 from .preprocessing import convert_to_linear16, get_audio_duration, to_mono
 
@@ -18,4 +22,6 @@ __all__ = [
     "to_mono",
     "get_audio_duration",
     "PerUserTranscriptionCoordinator",
+    "TranscriptionUnavailableError",
+    "DEFAULT_MAX_CONSECUTIVE_FAILURES",
 ]
