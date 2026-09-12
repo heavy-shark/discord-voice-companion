@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import wave
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 
 import pytest
 
+import src.transcription.gemini_stt as gemini_stt
 from src.models import TranscriptSegment
 from src.transcription.gemini_stt import (
     DEFAULT_LANGUAGE_HINTS,
     LIVE_SAMPLE_RATE_HZ,
+    MIN_LANGUAGE_HINTS_GENAI_VERSION,
     GeminiSTTClient,
     GeminiSTTError,
     _clean_transcript,
     _duration_seconds,
     _pcm_to_wav,
+    language_hints_supported,
 )
 
 
@@ -116,6 +120,52 @@ def test_unrelated_errors_do_not_disable_language_hints() -> None:
     assert not client._maybe_disable_language_hints(ValueError("quota exceeded"))
     hints = client._transcription_config().language_hints
     assert hints.language_codes == list(DEFAULT_LANGUAGE_HINTS)
+
+
+# ---------------------------------------------------------------------------
+# Old google-genai builds
+# ---------------------------------------------------------------------------
+
+
+def test_language_hints_support_needs_the_type_and_the_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert language_hints_supported() is True
+
+    monkeypatch.delattr(gemini_stt.types, "LanguageHints", raising=True)
+    assert language_hints_supported() is False
+
+
+def test_an_sdk_without_language_hints_falls_back_to_auto_detection(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """google-genai < 2.9.0 raised AttributeError per utterance, so the bot went deaf."""
+    monkeypatch.delattr(gemini_stt.types, "LanguageHints", raising=True)
+
+    with caplog.at_level(logging.WARNING, logger="src.transcription.gemini_stt"):
+        client = GeminiSTTClient("key", client=object())
+
+    config = client._transcription_config()
+    assert config.language_codes == []
+    assert config.language_hints is None
+    assert MIN_LANGUAGE_HINTS_GENAI_VERSION in caplog.text
+
+
+def test_a_config_that_will_not_build_degrades_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Building the config must never be what makes the bot deaf."""
+    client = GeminiSTTClient("key", client=object())
+
+    def explode(**_kwargs: object) -> None:
+        raise TypeError("unexpected keyword argument 'language_codes'")
+
+    monkeypatch.setattr(gemini_stt.types, "LanguageHints", explode)
+
+    assert client._transcription_config().language_hints is None
+    # The flag latches, so the next utterance skips the doomed branch entirely.
+    assert client._drop_language_hints is True
 
 
 # ---------------------------------------------------------------------------

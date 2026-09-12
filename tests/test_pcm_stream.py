@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from array import array
 
@@ -67,6 +68,75 @@ def test_feed_mono_is_upmixed_to_stereo() -> None:
     samples.frombytes(frame)
     # Left and right carry the same value.
     assert samples[0] == samples[1] == 5
+
+
+def drain(source: PCMStreamAudioSource) -> bytes:
+    """Read the source dry the way discord.py's player thread would."""
+    out = bytearray()
+    while True:
+        frame = source.read()
+        if not frame:
+            return bytes(out)
+        out.extend(frame)
+
+
+def rms(pcm: bytes) -> float:
+    samples = array("h")
+    samples.frombytes(pcm)
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(float(value) * value for value in samples) / len(samples))
+
+
+def test_feed_mono_carries_a_split_sample_across_chunks() -> None:
+    """HTTP chunks cut anywhere, including through the middle of a sample."""
+    source = PCMStreamAudioSource()
+    payload = mono(1000, -2000, 3000, -4000)
+    # Split so the second chunk starts mid-sample.
+    source.feed_mono(payload[:3])
+    source.feed_mono(payload[3:])
+    source.close_input()
+
+    assert drain(source).startswith(mono(1000, 1000, -2000, -2000, 3000, 3000, -4000, -4000))
+
+
+def test_odd_chunk_boundaries_do_not_distort_the_audio() -> None:
+    """The regression: a dropped byte shifted every later sample by one byte,
+    which plays back as very loud noise instead of speech."""
+    tone = array(
+        "h", [int(12000 * math.sin(2 * math.pi * 220 * i / 48000)) for i in range(9600)]
+    ).tobytes()
+
+    source = PCMStreamAudioSource()
+    position = 0
+    sizes = (1023, 4097, 511, 2049, 1024)  # as ElevenLabs streams it: mostly odd
+    for index in range(len(sizes) * 10):
+        if position >= len(tone):
+            break
+        size = sizes[index % len(sizes)]
+        source.feed_mono(tone[position : position + size])
+        position += size
+    source.close_input()
+
+    played = drain(source)
+    expected = mono_to_stereo(tone)
+
+    assert played[: len(expected)] == expected
+    # Byte-misaligned PCM16 is near full-scale noise; the level alone catches it.
+    assert rms(played) == 0.0 or abs(rms(played) - rms(expected)) < 1.0
+
+
+def test_stopping_clears_a_half_received_sample() -> None:
+    """A barge-in must not leave half a sample to prepend to the next reply."""
+    source = PCMStreamAudioSource()
+    source.feed_mono(b"\x01")
+    source.stop()
+
+    restarted = PCMStreamAudioSource()
+    restarted.feed_mono(mono(7))
+    restarted.close_input()
+
+    assert drain(restarted).startswith(mono(7, 7))
 
 
 def test_read_ends_immediately_when_stopped_mid_playback() -> None:

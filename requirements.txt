@@ -2,8 +2,10 @@
 discord.py>=2.7.1
 discord-ext-voice-recv>=0.5.2a179
 
-# Transcription + conversation (Gemini Live API transcription needs >=1.33)
-google-genai>=1.33.0
+# Transcription + conversation. 2.9.0 is the release that added LanguageHints to
+# AudioTranscriptionConfig; older builds raise AttributeError while the config is
+# being built, so every utterance fails before a request is even sent.
+google-genai>=2.9.0
 
 # Text-to-Speech: ElevenLabs is called over plain REST/WebSocket on purpose;
 # the official SDK is not a dependency.

@@ -62,13 +62,29 @@ class PCMStreamAudioSource(discord.AudioSource):
         self._stopped = False
         self._frames_read = 0
         self._starved_frames = 0
+        # Producer side only (one asyncio task): the trailing byte of a chunk
+        # that cut through the middle of a PCM16 sample.
+        self._mono_remainder = b""
 
     # ------------------------------------------------------------------
     # Producer side
     # ------------------------------------------------------------------
 
     def feed_mono(self, mono_pcm: bytes) -> None:
-        """Append 48 kHz *mono* PCM16 (what ElevenLabs ``pcm_48000`` returns)."""
+        """Append 48 kHz *mono* PCM16 (what ElevenLabs ``pcm_48000`` returns).
+
+        HTTP chunks cut at arbitrary byte offsets, so roughly half of them end
+        mid-sample. The odd byte is carried into the next chunk: dropping it
+        would shift every later sample by one byte, which plays back as very
+        loud noise rather than speech.
+        """
+        if not mono_pcm:
+            return
+        if self._mono_remainder:
+            mono_pcm = self._mono_remainder + mono_pcm
+            self._mono_remainder = b""
+        if len(mono_pcm) % SAMPLE_WIDTH_BYTES:
+            mono_pcm, self._mono_remainder = mono_pcm[:-1], mono_pcm[-1:]
         self.feed(mono_to_stereo(mono_pcm))
 
     def feed(self, stereo_pcm: bytes) -> None:
@@ -89,6 +105,7 @@ class PCMStreamAudioSource(discord.AudioSource):
 
     def stop(self) -> None:
         """Abandon buffered audio and end playback now (barge-in)."""
+        self._mono_remainder = b""
         with self._condition:
             self._stopped = True
             self._input_closed = True

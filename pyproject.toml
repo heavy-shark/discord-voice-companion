@@ -21,7 +21,7 @@ dependencies = [
     "davey>=0.1.5",
     
     # Transcription + conversation (Gemini Live API transcription needs >=1.33)
-    "google-genai>=1.33.0",
+    "google-genai>=2.9.0",
 
     # Text-to-Speech: ElevenLabs is called over plain REST/WebSocket, so the
     # official SDK is deliberately not a dependency (it also breaks pip installs

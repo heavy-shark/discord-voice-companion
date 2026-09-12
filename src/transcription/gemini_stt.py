@@ -45,6 +45,20 @@ DEFAULT_LIVE_MODEL = "gemini-3.5-transcribe-live"
 DEFAULT_BATCH_MODEL = "gemini-2.5-flash"
 DEFAULT_LANGUAGE_HINTS: tuple[str, ...] = ("uk-UA", "ru-RU", "en-US")
 
+# ``AudioTranscriptionConfig.language_hints`` and the ``LanguageHints`` type were
+# added in google-genai 2.9.0. Older builds raise AttributeError while the config
+# is being *built*, so the request never leaves the process and every utterance
+# dies the same way.
+MIN_LANGUAGE_HINTS_GENAI_VERSION = "2.9.0"
+
+
+def language_hints_supported() -> bool:
+    """Whether the installed google-genai can express language hints at all."""
+    if getattr(types, "LanguageHints", None) is None:
+        return False
+    fields = getattr(types.AudioTranscriptionConfig, "model_fields", None) or {}
+    return "language_hints" in fields
+
 # The Live API expects 16 kHz mono PCM16; the coordinator resamples to match.
 LIVE_SAMPLE_RATE_HZ = 16000
 
@@ -150,9 +164,21 @@ class GeminiSTTClient:
 
         # ``client`` is an injection seam for tests; production always builds one.
         self._client = client if client is not None else genai.Client(api_key=key)
-        # Set once the server rejects the optional biasing fields, so we stop
-        # re-sending them for every subsequent utterance.
+        # Set once the SDK or the server rejects the optional biasing fields, so
+        # we stop re-sending them for every subsequent utterance.
         self._drop_language_hints = False
+        if self.language_hints and not language_hints_supported():
+            # Hints only bias detection; an empty language_codes list still means
+            # "detect automatically", so transcription keeps working without them.
+            self._drop_language_hints = True
+            logger.warning(
+                "google-genai %s cannot express language hints, so transcription will rely on "
+                "automatic detection alone. Upgrade to google-genai>=%s "
+                "(pip install -r requirements.txt) to bias recognition towards %s.",
+                getattr(genai, "__version__", "?"),
+                MIN_LANGUAGE_HINTS_GENAI_VERSION,
+                ",".join(self.language_hints),
+            )
 
         logger.info(
             "GeminiSTTClient initialized (backend=%s, model=%s, hints=%s)",
@@ -229,14 +255,26 @@ class GeminiSTTClient:
             yield segment
 
     def _transcription_config(self) -> types.AudioTranscriptionConfig:
-        """Build the transcription config, minus any field the server rejected."""
+        """Build the transcription config, minus any field the SDK or server rejected."""
+        # An empty language_codes list is what enables automatic detection.
         if self._drop_language_hints or not self.language_hints:
-            # An empty language_codes list is what enables automatic detection.
             return types.AudioTranscriptionConfig(language_codes=[])
-        return types.AudioTranscriptionConfig(
-            language_codes=[],
-            language_hints=types.LanguageHints(language_codes=list(self.language_hints)),
-        )
+        try:
+            return types.AudioTranscriptionConfig(
+                language_codes=[],
+                language_hints=types.LanguageHints(language_codes=list(self.language_hints)),
+            )
+        except Exception:
+            # Building the config must never be what makes the bot deaf: degrade
+            # to automatic detection and say so once.
+            self._drop_language_hints = True
+            logger.warning(
+                "This google-genai build rejected the language hints; falling back to "
+                "automatic language detection. Upgrade to google-genai>=%s.",
+                MIN_LANGUAGE_HINTS_GENAI_VERSION,
+                exc_info=True,
+            )
+            return types.AudioTranscriptionConfig(language_codes=[])
 
     async def _stream_recognize_live(
         self,
