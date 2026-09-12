@@ -10,15 +10,28 @@ from src.storage.settings import SettingsStore
 
 
 def test_resolve_pricing_config_defaults(tmp_path: Path) -> None:
+    """Published list prices, Sept 2026: Gemini 2.5 Flash and ElevenLabs Creator."""
     path = tmp_path / "settings.json"
     path.write_text("{}", encoding="utf-8")
     store = SettingsStore(settings_path=path)
     p = store.resolve_pricing_config()
-    assert p["elevenlabs_usd_per_1k_characters"] == pytest.approx(0.1)
-    assert p["genai_usd_per_1m_input_tokens"] == pytest.approx(0.25)
-    assert p["genai_usd_per_1m_output_tokens"] == pytest.approx(1.5)
-    # Gemini bills audio as tokens, far below the old Cloud Speech per-minute rate.
+    assert p["elevenlabs_usd_per_1k_characters"] == pytest.approx(0.18)
+    assert p["genai_usd_per_1m_input_tokens"] == pytest.approx(0.30)
+    assert p["genai_usd_per_1m_output_tokens"] == pytest.approx(2.50)
+    # Audio input is its own, much higher rate; transcription is priced with it.
+    assert p["genai_usd_per_1m_audio_input_tokens"] == pytest.approx(1.00)
     assert p["google_stt_usd_per_minute"] == pytest.approx(0.001)
+
+
+def test_the_audio_input_rate_can_be_overridden_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GENAI_USD_PER_1M_AUDIO_INPUT_TOKENS", "2.5")
+    path = tmp_path / "settings.json"
+    path.write_text("{}", encoding="utf-8")
+    store = SettingsStore(settings_path=path)
+    rates = store.resolve_pricing_config()
+    assert rates["genai_usd_per_1m_audio_input_tokens"] == pytest.approx(2.5)
 
 
 def test_resolve_pricing_config_settings_override_env(

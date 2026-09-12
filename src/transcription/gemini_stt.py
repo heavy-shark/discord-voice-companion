@@ -32,6 +32,7 @@ import logging
 import wave
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 from google import genai
@@ -50,6 +51,29 @@ DEFAULT_LANGUAGE_HINTS: tuple[str, ...] = ("uk-UA", "ru-RU", "en-US")
 # is being *built*, so the request never leaves the process and every utterance
 # dies the same way.
 MIN_LANGUAGE_HINTS_GENAI_VERSION = "2.9.0"
+
+
+@dataclass
+class SttTokenUsage:
+    """Cumulative Gemini tokens spent on transcription, split by billing rate."""
+
+    audio_input_tokens: int = 0
+    text_input_tokens: int = 0
+    output_tokens: int = 0
+
+
+def _modality_token_counts(details: object) -> dict[str, int]:
+    """Map a ``prompt_tokens_details`` list to {modality: tokens}."""
+    counts: dict[str, int] = {}
+    for entry in list(details or []):  # type: ignore[call-overload]
+        modality = str(getattr(entry, "modality", "") or "").upper()
+        tokens = getattr(entry, "token_count", None)
+        if not modality or not isinstance(tokens, int) or tokens <= 0:
+            continue
+        # "MediaModality.AUDIO" and "AUDIO" both appear depending on SDK build.
+        key = modality.rsplit(".", 1)[-1]
+        counts[key] = counts.get(key, 0) + tokens
+    return counts
 
 
 def language_hints_supported() -> bool:
@@ -164,6 +188,9 @@ class GeminiSTTClient:
 
         # ``client`` is an injection seam for tests; production always builds one.
         self._client = client if client is not None else genai.Client(api_key=key)
+        # Transcription is billed like any other Gemini call, and audio input is
+        # its own (much pricier) rate, so audio and text tokens are kept apart.
+        self.usage = SttTokenUsage()
         # Set once the SDK or the server rejects the optional biasing fields, so
         # we stop re-sending them for every subsequent utterance.
         self._drop_language_hints = False
@@ -466,6 +493,8 @@ class GeminiSTTClient:
                     f"Gemini batch transcription failed on model {self.batch_model!r}: {exc}"
                 ) from exc
 
+        self._accumulate_usage(response)
+
         text = _clean_transcript(getattr(response, "text", "") or "")
         if not text:
             logger.debug("Batch transcription returned no speech for %s.", username)
@@ -479,6 +508,37 @@ class GeminiSTTClient:
             end_ts=utterance_started_at + duration,
             is_final=True,
             language_code=_first_response_language(response),
+        )
+
+    def _accumulate_usage(self, response: Any) -> None:
+        """Record what this transcription cost, audio tokens kept separate."""
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return
+
+        prompt_total = getattr(usage, "prompt_token_count", None)
+        prompt_total = prompt_total if isinstance(prompt_total, int) and prompt_total > 0 else 0
+        by_modality = _modality_token_counts(getattr(usage, "prompt_tokens_details", None))
+        audio = by_modality.get("AUDIO", 0)
+
+        if audio:
+            self.usage.audio_input_tokens += audio
+            self.usage.text_input_tokens += max(0, prompt_total - audio)
+        elif prompt_total:
+            # No per-modality breakdown: the utterance is overwhelmingly audio,
+            # and pricing it as text would understate the bill three-fold.
+            self.usage.audio_input_tokens += prompt_total
+
+        output = getattr(usage, "candidates_token_count", None)
+        if isinstance(output, int) and output > 0:
+            self.usage.output_tokens += output
+
+    def get_token_usage_breakdown(self) -> tuple[int, int, int]:
+        """Cumulative (audio input, text input, output) tokens spent transcribing."""
+        return (
+            self.usage.audio_input_tokens,
+            self.usage.text_input_tokens,
+            self.usage.output_tokens,
         )
 
     def _maybe_disable_language_hints(self, exc: BaseException) -> bool:

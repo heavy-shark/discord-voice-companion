@@ -225,6 +225,96 @@ async def test_should_volunteer_stays_quiet_on_empty_input_or_failure(
         assert await mgr.should_volunteer("Alice: hmm") is False
 
 
+def gate_response(text: str, finish_reason: str = "STOP") -> MagicMock:
+    """A generate_content result with a finish reason the gate can inspect."""
+    candidate = MagicMock()
+    candidate.finish_reason = finish_reason
+    return MagicMock(text=text, usage_metadata=None, candidates=[candidate])
+
+
+def gate_client() -> tuple[MagicMock, MagicMock]:
+    fake_models = MagicMock()
+    fake_aio = MagicMock()
+    fake_aio.models = fake_models
+    fake_aio.chats = MagicMock()
+    fake_aio.chats.create = MagicMock(return_value=AsyncMock())
+    fake_client = MagicMock()
+    fake_client.aio = fake_aio
+    return fake_client, fake_models
+
+
+@pytest.mark.asyncio
+async def test_the_volunteer_gate_asks_a_thinking_model_not_to_think(
+    sample_persona: Persona,
+) -> None:
+    """A thinking model spends the whole output budget reasoning and says nothing."""
+    fake_client, fake_models = gate_client()
+    fake_models.generate_content = AsyncMock(return_value=gate_response("YES"))
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")
+        await mgr.create_chat_session(sample_persona)
+        assert await mgr.should_volunteer("Alice: what time is it?") is True
+
+    config = fake_models.generate_content.await_args.kwargs["config"]
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget == 0
+    # Room for the answer even if a model ignores the request not to think.
+    assert config.max_output_tokens > 4
+
+
+@pytest.mark.asyncio
+async def test_an_empty_gate_verdict_is_retried_with_room_to_think(
+    sample_persona: Persona,
+) -> None:
+    """The regression: MAX_TOKENS with empty text read as "NO" forever, muting the bot."""
+    fake_client, fake_models = gate_client()
+    fake_models.generate_content = AsyncMock(
+        side_effect=[gate_response("", "MAX_TOKENS"), gate_response("YES")]
+    )
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")
+        await mgr.create_chat_session(sample_persona)
+        assert await mgr.should_volunteer("Alice: what time is it?") is True
+
+    assert fake_models.generate_content.await_count == 2
+    retry_config = fake_models.generate_content.await_args_list[1].kwargs["config"]
+    assert retry_config.thinking_config is None
+    assert retry_config.max_output_tokens > 8
+
+
+@pytest.mark.asyncio
+async def test_a_gate_that_never_answers_stays_quiet(sample_persona: Persona) -> None:
+    fake_client, fake_models = gate_client()
+    fake_models.generate_content = AsyncMock(
+        side_effect=[gate_response("", "MAX_TOKENS"), gate_response("", "MAX_TOKENS")]
+    )
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")
+        await mgr.create_chat_session(sample_persona)
+        assert await mgr.should_volunteer("Alice: what time is it?") is False
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_refuses_to_disable_thinking_still_gets_asked(
+    sample_persona: Persona,
+) -> None:
+    """thinking_budget=0 is not universally supported; the gate must not break on it."""
+    fake_client, fake_models = gate_client()
+    fake_models.generate_content = AsyncMock(
+        side_effect=[ValueError("thinking_budget is not supported"), gate_response("YES")]
+    )
+
+    with patch("src.conversation.chat.genai.Client", return_value=fake_client):
+        mgr = GenAIChatManager(api_key="fake-key-for-test")
+        await mgr.create_chat_session(sample_persona)
+        assert await mgr.should_volunteer("Alice: what time is it?") is True
+
+    assert fake_models.generate_content.await_count == 2
+
+
 def test_repair_utf8_mojibake_scandinavian_chars() -> None:
     broken = "hj\u00c3\u00a6lpsom p\u00c3\u00a5 norsk"
     fixed = repair_utf8_mojibake(broken)

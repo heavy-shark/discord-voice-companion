@@ -73,6 +73,15 @@ class FakeSettingsStore:
     def resolve_stt_emit_interim(self) -> bool:
         return False
 
+    def resolve_pricing_config(self) -> dict[str, float]:
+        return {
+            "elevenlabs_usd_per_1k_characters": 0.18,
+            "genai_usd_per_1m_input_tokens": 0.30,
+            "genai_usd_per_1m_output_tokens": 2.50,
+            "genai_usd_per_1m_audio_input_tokens": 1.00,
+            "google_stt_usd_per_minute": 0.001,
+        }
+
 
 class FakeDiscordClient:
     def __init__(self) -> None:
@@ -127,6 +136,7 @@ class FakeTTSClient:
         self.remaining_failures = failures
         self.error = error or RuntimeError("401 Unauthorized: quota exhausted")
         self.spoken: list[str] = []
+        self.total_characters_synthesized = 0
 
     def stream_pcm(self, text: str, _persona: Persona) -> AsyncIterator[bytes]:
         async def generate() -> AsyncIterator[bytes]:
@@ -141,8 +151,8 @@ class FakeTTSClient:
     def record_tts_duration(self, _seconds: float) -> None:
         return None
 
-    def record_tts_characters(self, _count: int) -> None:
-        return None
+    def record_tts_characters(self, count: int) -> None:
+        self.total_characters_synthesized += int(count)
 
 
 class FakePlaybackManager:
@@ -224,6 +234,9 @@ class FakeSTTClient:
 
     async def validate_connectivity(self) -> None:
         return None
+
+    def get_token_usage_breakdown(self) -> tuple[int, int, int]:
+        return (0, 0, 0)
 
     def stream_recognize(self, **_kwargs: object) -> AsyncIterator[object]:
         async def generate() -> AsyncIterator[object]:
@@ -443,6 +456,52 @@ async def test_the_session_logs_which_task_ended_it(
 
     assert "genai-supervisor" in caplog.text
     assert "Voice session ending" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# What the session costs
+# ---------------------------------------------------------------------------
+
+
+async def test_costs_are_logged_in_batches_and_as_a_running_total(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(runner_module, "_COST_REPORT_INTERVAL_SECONDS", 0.05)
+    tts_client = FakeTTSClient("key")
+
+    with caplog.at_level(logging.INFO, logger="src.session.conversation_runner"):
+        task, stop_event, _discord_client = await start_session(
+            monkeypatch, tts_client=tts_client
+        )
+        assert await wait_for(lambda: "Cost session total" in caplog.text)
+        await stop_session(task, stop_event)
+
+    assert "Cost last 30s" in caplog.text
+    assert "Cost session total" in caplog.text
+    # The tail of the session never fills a window, so it is reported separately.
+    assert "Cost session final" in caplog.text
+    assert tts_client.total_characters_synthesized > 0
+    assert f"voice {tts_client.total_characters_synthesized} chars" in caplog.text
+
+
+async def test_an_idle_window_does_not_spam_the_log(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nothing said, nothing spent, nothing to report."""
+    monkeypatch.setattr(runner_module, "_COST_REPORT_INTERVAL_SECONDS", 0.05)
+    policy = AlwaysReplyPolicy()
+    policy.evaluate = lambda **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        should_reply=False, reason=None
+    )
+
+    with caplog.at_level(logging.INFO, logger="src.session.conversation_runner"):
+        task, stop_event, _discord_client = await start_session(monkeypatch, policy=policy)
+        await asyncio.sleep(0.2)
+        await stop_session(task, stop_event)
+
+    assert "Cost last 30s" not in caplog.text
 
 
 async def test_a_clean_stop_names_the_task_that_finished(

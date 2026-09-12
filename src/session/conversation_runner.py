@@ -27,6 +27,7 @@ from ..storage import SettingsStore, TranscriptSessionWriter
 from ..storage.transcripts import attach_active_transcript_writer, detach_active_transcript_writer
 from ..transcription import GeminiSTTClient, PerUserTranscriptionCoordinator
 from ..tts import ElevenLabsTTSClient
+from .costs import UsageSnapshot, format_cost_report, zeroed
 from .metrics import SessionMetrics
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,9 @@ _DISCORD_NICKNAME_MAX_LEN = 32
 # per-reply failures, not session failures. Keep answering the room until a long
 # unbroken streak says the service is really gone.
 _MAX_CONSECUTIVE_REPLY_FAILURES = 10
+
+# How often the running cost of the session is written to the log.
+_COST_REPORT_INTERVAL_SECONDS = 30.0
 
 
 class ReplyPipelineError(RuntimeError):
@@ -288,6 +292,34 @@ async def run_voice_conversation(
             metrics.status_line = f"interrupted by {username}"
         asyncio.create_task(playback_manager.stop_playback(), name="barge-in-stop")
 
+    def usage_snapshot() -> UsageSnapshot:
+        """Every billable unit this session has consumed so far."""
+        stt_audio_in, stt_text_in, stt_out = stt_client.get_token_usage_breakdown()
+        chat_in, chat_out = chat_manager.get_token_usage_breakdown()
+        return UsageSnapshot(
+            stt_audio_input_tokens=stt_audio_in,
+            stt_text_input_tokens=stt_text_in,
+            stt_output_tokens=stt_out,
+            chat_input_tokens=chat_in,
+            chat_output_tokens=chat_out,
+            tts_characters=tts_client.total_characters_synthesized,
+            stt_audio_seconds=metrics.stt_seconds if metrics is not None else 0.0,
+        )
+
+    async def report_costs_loop() -> None:
+        """Log the bill every 30 s: the batch just spent, then the running total."""
+        rates = settings_store.resolve_pricing_config()
+        previous = zeroed(usage_snapshot())
+        while True:
+            await asyncio.sleep(_COST_REPORT_INTERVAL_SECONDS)
+            total = usage_snapshot()
+            batch = total - previous
+            previous = total
+            if batch.is_empty:
+                continue
+            logger.info("%s", format_cost_report("last 30s", batch, rates))
+            logger.info("%s", format_cost_report("session total", total, rates))
+
     def on_transcription_error(error: BaseException, consecutive_failures: int) -> None:
         """Surface dropped utterances in ``/status`` instead of ending the session."""
         if metrics is not None:
@@ -310,6 +342,7 @@ async def run_voice_conversation(
 
     runtime_task: asyncio.Task[None] | None = None
     supervisor_task: asyncio.Task[None] | None = None
+    cost_task: asyncio.Task[None] | None = None
     supervisor_stop = {"go": True}
 
     try:
@@ -486,6 +519,7 @@ async def run_voice_conversation(
         if runner_config.greet_on_join and channel is not None:
             discord_client.set_voice_join_handler(int(channel.id), on_voice_user_joined)
         supervisor_task = asyncio.create_task(supervise_loop(), name="genai-supervisor")
+        cost_task = asyncio.create_task(report_costs_loop(), name="cost-reporter")
         assert runtime_task is not None
         done, _ = await asyncio.wait(
             {consumer_task, runtime_task, supervisor_task},
@@ -504,6 +538,10 @@ async def run_voice_conversation(
         try:
             discord_client.set_voice_join_handler(None, None)
             supervisor_stop["go"] = False
+            if cost_task is not None:
+                cost_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cost_task
             if supervisor_task is not None:
                 supervisor_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -520,6 +558,16 @@ async def run_voice_conversation(
             consumer_stop_event.set()
             await consumer_task
             logger.info("Conversation mode stopped. Snapshot saved to %s", transcript_writer.path)
+            # The last partial window never reaches the 30 s reporter, so the
+            # final total is logged here rather than being rounded away.
+            logger.info(
+                "%s",
+                format_cost_report(
+                    "session final",
+                    usage_snapshot(),
+                    settings_store.resolve_pricing_config(),
+                ),
+            )
 
             inp, out = chat_manager.get_token_usage_breakdown()
             transcript_writer.set_genai_token_counts(inp, out)

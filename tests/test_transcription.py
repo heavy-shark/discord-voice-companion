@@ -273,6 +273,71 @@ async def test_batch_backend_surfaces_other_failures() -> None:
 
 
 # ---------------------------------------------------------------------------
+# What transcription costs
+# ---------------------------------------------------------------------------
+
+
+def usage(prompt: int, output: int, *, audio: int | None = None) -> SimpleNamespace:
+    details = None
+    if audio is not None:
+        details = [SimpleNamespace(modality="MediaModality.AUDIO", token_count=audio)]
+    return SimpleNamespace(
+        prompt_token_count=prompt,
+        candidates_token_count=output,
+        prompt_tokens_details=details,
+    )
+
+
+class UsageReportingModels(FakeBatchModels):
+    def __init__(self, usage_metadata: object, text: str = "привіт") -> None:
+        super().__init__(text=text)
+        self.usage_metadata = usage_metadata
+
+    async def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(text=self.text, candidates=[], usage_metadata=self.usage_metadata)
+
+
+async def test_audio_and_text_prompt_tokens_are_counted_separately() -> None:
+    """Audio bills at its own rate, so it must not be merged into the text total."""
+    models = UsageReportingModels(usage(prompt=340, output=12, audio=320))
+    client = GeminiSTTClient("key", backend="batch", client=fake_batch_client(models))
+
+    await collect(client, pcm(1.0))
+
+    assert client.get_token_usage_breakdown() == (320, 20, 12)
+
+
+async def test_tokens_accumulate_across_utterances() -> None:
+    models = UsageReportingModels(usage(prompt=100, output=5, audio=90))
+    client = GeminiSTTClient("key", backend="batch", client=fake_batch_client(models))
+
+    await collect(client, pcm(1.0))
+    await collect(client, pcm(1.0))
+
+    assert client.get_token_usage_breakdown() == (180, 20, 10)
+
+
+async def test_a_prompt_with_no_modality_breakdown_is_priced_as_audio() -> None:
+    """An utterance is overwhelmingly audio; calling it text understates the bill."""
+    models = UsageReportingModels(usage(prompt=500, output=9))
+    client = GeminiSTTClient("key", backend="batch", client=fake_batch_client(models))
+
+    await collect(client, pcm(1.0))
+
+    assert client.get_token_usage_breakdown() == (500, 0, 9)
+
+
+async def test_a_response_without_usage_metadata_counts_nothing() -> None:
+    models = FakeBatchModels()
+    client = GeminiSTTClient("key", backend="batch", client=fake_batch_client(models))
+
+    await collect(client, pcm(1.0))
+
+    assert client.get_token_usage_breakdown() == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
 # Live backend
 # ---------------------------------------------------------------------------
 

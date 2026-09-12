@@ -55,6 +55,23 @@ DEFAULT_STT_CONFIG: Dict[str, Any] = {
     "emit_interim": True,
 }
 
+# USD rate card for session cost estimates. Published list prices as of
+# September 2026; override per deployment in settings.json or via env.
+#   Gemini 2.5 Flash paid tier: $0.30/1M text in, $1.00/1M audio in, $2.50/1M out
+#     (https://ai.google.dev/gemini-api/docs/pricing)
+#   ElevenLabs: $0.17-0.20 per 1k characters across the Starter/Creator/Pro
+#     tiers; the Creator rate is the default here.
+DEFAULT_PRICING: Dict[str, float] = {
+    "elevenlabs_usd_per_1k_characters": 0.18,
+    "genai_usd_per_1m_input_tokens": 0.30,
+    "genai_usd_per_1m_output_tokens": 2.50,
+    # Transcription sends audio, which Gemini bills at its own higher rate.
+    "genai_usd_per_1m_audio_input_tokens": 1.00,
+    # Legacy per-minute proxy, kept for the TUI tile and old settings files.
+    # The session cost report prices transcription by real tokens instead.
+    "google_stt_usd_per_minute": 0.001,
+}
+
 
 def _split_language_codes(raw: Any) -> List[str]:
     """Parse "uk-UA, ru-RU, en-US" (or a list) into a clean list of BCP-47 codes."""
@@ -527,14 +544,7 @@ class SettingsStore:
 
     def get_pricing_config(self) -> Dict[str, float]:
         """USD rate card for live session cost estimates (merged with defaults)."""
-        defaults: Dict[str, float] = {
-            "elevenlabs_usd_per_1k_characters": 0.1,
-            "genai_usd_per_1m_input_tokens": 0.25,
-            "genai_usd_per_1m_output_tokens": 1.5,
-            # Gemini bills audio as tokens (32/second), which works out far below
-            # the old Google Cloud Speech per-minute rate this used to default to.
-            "google_stt_usd_per_minute": 0.001,
-        }
+        defaults: Dict[str, float] = dict(DEFAULT_PRICING)
         stored = self.settings.get("pricing")
         if not isinstance(stored, dict):
             return dict(defaults)
@@ -577,12 +587,33 @@ class SettingsStore:
         raw_block = self.settings.get("pricing")
         raw: Dict[str, Any] = raw_block if isinstance(raw_block, dict) else {}
         specs: list[tuple[str, str, float]] = [
-            ("elevenlabs_usd_per_1k_characters", "ELEVENLABS_USD_PER_1K_CHARACTERS", 0.1),
+            (
+                "elevenlabs_usd_per_1k_characters",
+                "ELEVENLABS_USD_PER_1K_CHARACTERS",
+                DEFAULT_PRICING["elevenlabs_usd_per_1k_characters"],
+            ),
             # Env names are upper-case: os.environ is case-insensitive on Windows
             # but not on Linux, where the lower-case "1m" spelling silently missed.
-            ("genai_usd_per_1m_input_tokens", "GENAI_USD_PER_1M_INPUT_TOKENS", 0.25),
-            ("genai_usd_per_1m_output_tokens", "GENAI_USD_PER_1M_OUTPUT_TOKENS", 1.5),
-            ("google_stt_usd_per_minute", "GOOGLE_STT_USD_PER_MINUTE", 0.001),
+            (
+                "genai_usd_per_1m_input_tokens",
+                "GENAI_USD_PER_1M_INPUT_TOKENS",
+                DEFAULT_PRICING["genai_usd_per_1m_input_tokens"],
+            ),
+            (
+                "genai_usd_per_1m_output_tokens",
+                "GENAI_USD_PER_1M_OUTPUT_TOKENS",
+                DEFAULT_PRICING["genai_usd_per_1m_output_tokens"],
+            ),
+            (
+                "genai_usd_per_1m_audio_input_tokens",
+                "GENAI_USD_PER_1M_AUDIO_INPUT_TOKENS",
+                DEFAULT_PRICING["genai_usd_per_1m_audio_input_tokens"],
+            ),
+            (
+                "google_stt_usd_per_minute",
+                "GOOGLE_STT_USD_PER_MINUTE",
+                DEFAULT_PRICING["google_stt_usd_per_minute"],
+            ),
         ]
         resolved: Dict[str, float] = {}
         for key, env_name, default in specs:

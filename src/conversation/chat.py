@@ -15,6 +15,29 @@ from ..storage.reply_locale import is_auto_reply_locale
 
 logger = logging.getLogger(__name__)
 
+# The gate answers one word, but "one word" is not the same as "few tokens" on a
+# thinking model: reasoning tokens come out of the same budget and leave nothing
+# visible behind. Thinking is switched off for the usual call; the retry that
+# allows it needs room for the reasoning *and* the answer.
+_GATE_MAX_OUTPUT_TOKENS = 8
+_GATE_THINKING_MAX_OUTPUT_TOKENS = 512
+
+
+def _response_text(response: Any) -> str:
+    return (getattr(response, "text", None) or "").strip().upper()
+
+
+def _finish_reason(response: Any) -> str:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return "unknown"
+    return str(getattr(candidates[0], "finish_reason", "unknown"))
+
+
+def _hit_output_cap(response: Any) -> bool:
+    """True when the model stopped because it ran out of output budget."""
+    return _finish_reason(response).upper().endswith("MAX_TOKENS")
+
 # Human-readable names for the tags the companion is expected to hear. Prompting
 # with "Ukrainian" is far more reliable than prompting with "uk-UA".
 _LANGUAGE_NAMES: dict[str, str] = {
@@ -343,28 +366,67 @@ class GenAIChatManager:
         )
 
         try:
-            response = await self._client.aio.models.generate_content(
-                model=gate_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=4,
-                    system_instruction=(
-                        "You gate an AI companion's unprompted interjections. "
-                        "Reply with YES or NO and nothing else. When unsure, say NO."
-                    ),
-                ),
-            )
+            response = await self._gate_request(prompt, gate_model, thinking=False)
+            verdict = _response_text(response)
+            if not verdict and _hit_output_cap(response):
+                # A thinking model spent the whole budget reasoning and emitted
+                # nothing. Left unhandled this reads as "NO" every single time,
+                # which silently mutes the bot for good.
+                logger.warning(
+                    "Volunteer gate produced no text within %d tokens (finish=%s); retrying "
+                    "with room for the model to think.",
+                    _GATE_MAX_OUTPUT_TOKENS,
+                    _finish_reason(response),
+                )
+                response = await self._gate_request(prompt, gate_model, thinking=True)
+                verdict = _response_text(response)
         except Exception as exc:
             # Staying quiet is the safe failure mode for an uninvited remark.
             logger.warning("Volunteer gate failed (%s); staying quiet.", exc)
             return False
 
-        self._accumulate_usage(response)
-        verdict = (getattr(response, "text", None) or "").strip().upper()
+        if not verdict:
+            logger.warning(
+                "Volunteer gate returned no verdict (finish=%s); staying quiet.",
+                _finish_reason(response),
+            )
+            return False
+
         decision = verdict.startswith("YES")
-        logger.info("Volunteer gate: %s -> %s", verdict or "(empty)", decision)
+        logger.info("Volunteer gate: %s -> %s", verdict, decision)
         return decision
+
+    async def _gate_request(self, prompt: str, gate_model: str, *, thinking: bool) -> Any:
+        """One volunteer-gate call. ``thinking=False`` is the cheap, usual path."""
+        config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=_GATE_THINKING_MAX_OUTPUT_TOKENS if thinking else _GATE_MAX_OUTPUT_TOKENS,
+            system_instruction=(
+                "You gate an AI companion's unprompted interjections. "
+                "Reply with YES or NO and nothing else. When unsure, say NO."
+            ),
+        )
+        if not thinking:
+            # Without this, a thinking model burns the whole output budget on
+            # reasoning tokens and returns empty text.
+            config.thinking_config = types.ThinkingConfig(thinking_budget=0)
+
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=gate_model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception:
+            if thinking:
+                raise
+            # Some models refuse thinking_budget=0; fall back to letting them think.
+            # That path accounts for its own usage, hence the early return.
+            logger.debug("Gate model %s rejected thinking_budget=0; retrying.", gate_model)
+            return await self._gate_request(prompt, gate_model, thinking=True)
+
+        self._accumulate_usage(response)
+        return response
 
     async def count_tokens(self, text: str) -> int:
         """
