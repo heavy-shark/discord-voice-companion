@@ -134,15 +134,24 @@ All of it lives in `.env`, and anything saved from the settings editor in
 
 | Key | Default | Meaning |
 |---|---|---|
-| `GEMINI_STT_BACKEND` | `live` | `live` streams into the Gemini Live API (lowest latency, emits partial text); `batch` sends one request per utterance |
+| `GEMINI_STT_BACKEND` | `batch` | `batch` sends one request per utterance (~2 s, verified working); `live` streams into the Gemini Live API — see the caveat below |
 | `GEMINI_STT_LIVE_MODEL` | `gemini-3.5-transcribe-live` | Model for the `live` backend |
 | `GEMINI_STT_BATCH_MODEL` | `gemini-2.5-flash` | Model for the `batch` backend |
 | `GEMINI_STT_LANGUAGE_HINTS` | `uk-UA,ru-RU,en-US` | Biases auto-detection; blank means unbiased |
 | `STT_IDLE_TIMEOUT_SECONDS` | `1.2` | Silence gap that ends one speaker's utterance |
 
-`gemini-3.5-transcribe-live` was in public preview at the time of writing. If your
-key does not have it, startup fails with the list of models it *does* have — set
-`GEMINI_STT_LIVE_MODEL` to one of those, or switch to the `batch` backend.
+**The `live` backend does not currently work here.** The coordinator hands the STT
+client a complete utterance, and pushing one at the Live API makes the service
+close the socket with `1008` ("operation aborted"); pacing the audio at real-time
+speed did not help. The Live API expects one long-lived session fed as the person
+speaks, not a session per utterance — reworking the coordinator that way is the
+fix, and until then `batch` is the default.
+
+`batch` costs roughly 2 s of latency per utterance (measured: 1.8–2.4 s for short
+sentences), on top of ~1–2.5 s for the reply itself.
+
+If startup reports the model is unavailable on your key, it prints the list of
+models that *are* available — set `GEMINI_STT_BATCH_MODEL` to one of those.
 
 ### Behaviour
 

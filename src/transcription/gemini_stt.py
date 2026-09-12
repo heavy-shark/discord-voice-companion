@@ -3,16 +3,22 @@
 Two interchangeable backends, both exposing the ``stream_recognize`` shape that
 :class:`~src.transcription.coordinator.PerUserTranscriptionCoordinator` drives:
 
+``batch`` (default)
+    Buffers the whole utterance, wraps it in a WAV container and sends one
+    ``generate_content`` call. No text until the speaker stops, but it works
+    with any audio-capable Gemini model and is the only backend verified
+    end to end against the live service.
+
 ``live``
     Streams the utterance into ``gemini-3.5-transcribe-live`` over the Live API
-    WebSocket and yields interim hypotheses plus a final transcript. Lowest
-    latency, and the only backend that produces partial text.
+    WebSocket and yields interim hypotheses plus a final transcript.
 
-``batch``
-    Buffers the whole utterance, wraps it in a WAV container and sends one
-    ``generate_content`` call. Slower (no text until the speaker stops) but it
-    works with any audio-capable Gemini model, so it is the fallback when the
-    live transcription model is not available on an API key.
+    Known broken with this architecture: the coordinator hands over a complete
+    utterance, and pushing it at once makes the service close the socket with
+    1008 ("operation aborted"). Real-time pacing did not help in testing. The
+    Live API wants one long-lived session fed as the speaker talks, not a
+    session per utterance — reworking the coordinator that way is what this
+    backend needs before it is usable.
 
 Both backends receive 16 kHz mono little-endian PCM16, which is what the
 coordinator already produces via ``convert_to_linear16``.
@@ -45,6 +51,12 @@ LIVE_SAMPLE_RATE_HZ = 16000
 # Utterances shorter than this are almost always a door slam or a cough. Sending
 # them wastes a request and tends to come back as hallucinated filler text.
 _MIN_UTTERANCE_SECONDS = 0.35
+
+# The Live API can accept a session, take the audio and then simply never send a
+# terminal message — observed when the audio holds no recognizable speech. Without
+# a ceiling the utterance task would wait forever and the speaker would be stuck
+# with no transcript, so give up and let the turn go untranscribed.
+_LIVE_RESPONSE_TIMEOUT_SECONDS = 30.0
 
 _BATCH_PROMPT = (
     "Transcribe the speech in this audio verbatim. "
@@ -279,7 +291,25 @@ class GeminiSTTClient:
             )
 
             try:
-                async for message in session.receive():
+                messages = session.receive().__aiter__()
+                while True:
+                    # Bound each wait rather than the loop as a whole: a slow but
+                    # live session should keep streaming, only a silent one dies.
+                    try:
+                        message = await asyncio.wait_for(
+                            messages.__anext__(), timeout=_LIVE_RESPONSE_TIMEOUT_SECONDS
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Gemini Live sent nothing for %.0fs on %s's utterance; "
+                            "abandoning it.",
+                            _LIVE_RESPONSE_TIMEOUT_SECONDS,
+                            username,
+                        )
+                        break
+
                     content = getattr(message, "server_content", None)
                     if content is None:
                         continue

@@ -18,7 +18,7 @@
         "last_persona_id": "default"
     },
     "stt": {
-        "backend": "live",
+        "backend": "batch",
         "live_model": "gemini-3.5-transcribe-live",
         "batch_model": "gemini-2.5-flash",
         "language_hints": [

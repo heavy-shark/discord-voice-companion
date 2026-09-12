@@ -40,7 +40,10 @@ DEFAULT_STT_LANGUAGE_HINTS: tuple[str, ...] = ("uk-UA", "ru-RU", "en-US")
 # this, not the other way round.
 DEFAULT_TALKATIVENESS = 65
 
-DEFAULT_STT_BACKEND = "live"
+# "batch" rather than "live": the Live API aborts the connection when a whole
+# buffered utterance is pushed at once, and utterance-at-a-time is exactly how
+# this bot segments Discord audio. See GeminiSTTClient for the detail.
+DEFAULT_STT_BACKEND = "batch"
 DEFAULT_STT_LIVE_MODEL = "gemini-3.5-transcribe-live"
 DEFAULT_STT_BATCH_MODEL = "gemini-2.5-flash"
 
