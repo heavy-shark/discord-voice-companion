@@ -16,6 +16,7 @@ import signal
 import sys
 from contextlib import suppress
 
+import discord
 from src.discord import DiscordClient
 from src.discord.companion_commands import register_companion_commands
 from src.discord.preflight import PreflightError, validate_voice_dependencies
@@ -169,10 +170,17 @@ async def run() -> int:
         await discord_client.connect()
     except Exception as exc:
         logger.error("Could not connect to Discord: %s", exc)
-        logger.error(
-            "Check DISCORD_TOKEN in .env — it must be the Bot token from the Developer "
-            "Portal (Bot tab -> Reset Token), not the client secret or application id."
-        )
+        if isinstance(exc.__cause__, discord.PrivilegedIntentsRequired):
+            # The token is fine; sending people to reset it wastes their time.
+            logger.error(
+                "This is the privileged intent above, not the token. Enable SERVER MEMBERS "
+                "INTENT in the Developer Portal and start again."
+            )
+        else:
+            logger.error(
+                "Check DISCORD_TOKEN in .env — it must be the Bot token from the Developer "
+                "Portal (Bot tab -> Reset Token), not the client secret or application id."
+            )
         logger.debug("Gateway failure detail", exc_info=True)
         # Close the aiohttp session the failed login left behind.
         with suppress(Exception):
