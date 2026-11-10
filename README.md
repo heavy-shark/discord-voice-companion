@@ -1,5 +1,7 @@
 # Discord Voice Companion
 
+![Discord Voice Companion](docs/cover.jpg)
+
 A Discord bot that sits in a voice channel and takes part in the conversation: it
 listens continuously, transcribes each speaker with **Gemini**, decides whether it
 has something worth saying, and answers out loud through **ElevenLabs** — in
@@ -61,12 +63,8 @@ and, since DAVE, not workable anyway), and two API keys.
 | 2 | `GOOGLE_GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) → Get API key |
 | 3 | `ELEVENLABS_API_KEY` | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
 
-Put all three in **`.env`** (already in the repo, with the fields empty and
-commented). Nothing else is required.
-
-> ⚠️ `.env` is committed on purpose so a deployment that clones the repo picks up
-> the config. **Keep the repository private.** If it is ever public, rotate all
-> three keys.
+Copy **`.env.example`** to **`.env`** and put all three in it. Nothing else is
+required. `.env` is git-ignored, so the keys never reach the repository.
 
 **Required intent.** In the Developer Portal → your app → **Bot** → *Privileged
 Gateway Intents*, switch on **SERVER MEMBERS INTENT**. The bot needs the member

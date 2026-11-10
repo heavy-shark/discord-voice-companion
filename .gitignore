@@ -1,7 +1,6 @@
-# NOTE: .env and settings.json are deliberately NOT ignored.
-# The deployment panel clones this repo and runs it as-is, so the config has to
-# travel with the code. That puts API keys in the repository history —
-# KEEP THIS REPOSITORY PRIVATE.
+# Local config: API keys live here
+.env
+settings.json
 
 # Python
 __pycache__/
